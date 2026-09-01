@@ -11,6 +11,11 @@
   Worktrees for <a href="https://opencode.ai">opencode</a> that pull down code you didn't write — each with its own index.
 </p>
 
+<p align="center">
+  <img src="./assets/demo.gif" width="860"
+       alt="Creating an isolated worktree with its own codegraph index, then teardown refusing to discard an uncommitted change until --force is passed">
+</p>
+
 ---
 
 In grafting, *scionwood* is the cuttings you take from another tree to join onto
@@ -280,6 +285,8 @@ npm install     # builds via `prepare`
 npm run build   # rebuild after editing .opencode/plugins/*.ts
 npm test        # bun + bash
 npm pack --dry-run   # verify the published tarball
+
+vhs assets/demo.tape # re-render the README demo after changing CLI output
 ```
 
 The package is `scionwood`. The build emits `dist/plugin.js`, `dist/plugin.d.ts`, `dist/index.js` (default-export wrapper), and `dist/scripts/wt` (executable bash CLI).
