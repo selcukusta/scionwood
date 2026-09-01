@@ -32,7 +32,10 @@ export const DEFAULT_CONFIG: Config = {
   tools: {
     codegraph: {
       detect: "codegraph",
-      dataDir: ".codegraph-{name}",
+      dataDir: ".codegraph",
+      // CODEGRAPH_DATA_DIR is ignored by the codegraph CLI, which always writes
+      // to <project>/.codegraph -- hence dataDir above. It is still injected for
+      // the MCP server, which is a separate consumer.
       env: { CODEGRAPH_PROJECT_PATH: "{worktree}", CODEGRAPH_DATA_DIR: "{dataDir}" },
       setup: "codegraph init -i && codegraph sync",
     },

@@ -548,7 +548,7 @@ config_defaults_json() {
   "tools": {
     "codegraph": {
       "detect": "codegraph",
-      "dataDir": ".codegraph-{name}",
+      "dataDir": ".codegraph",
       "env": { "CODEGRAPH_PROJECT_PATH": "{worktree}", "CODEGRAPH_DATA_DIR": "{dataDir}" },
       "setup": "codegraph init -i && codegraph sync"
     }
@@ -1618,6 +1618,24 @@ HOOK
     || fail "--version must resolve the package root through a symlink, got: $out"
   rm -f "$tmp/bin/wt-symlinked"
   pass "--version: reports the version and the running script, symlinked or not"
+
+  # the shipped dataDir must be where the tool ACTUALLY writes, or clean
+  # removes an empty directory and leaves the real index on disk. codegraph
+  # ignores CODEGRAPH_DATA_DIR and always writes to <project>/.codegraph.
+  jq -n '{tools:{"!codegraph":true, writer:{
+            dataDir: ".writer-data",
+            env: {WRITER_OUT: "{dataDir}"},
+            setup: "mkdir -p \"$WRITER_OUT\" && echo payload > \"$WRITER_OUT/index\""
+          }}}' > "$cfg"
+  out=$(w new review-pr-4680 --pr 4680 2>&1) || fail "new for dataDir-cleanup test: $out"
+  local dwt="$repo/.git-worktrees/review-pr-4680"
+  [[ -f "$dwt/.writer-data/index" ]] || fail "fixture: the tool did not write into its dataDir"
+  out=$(w clean review-pr-4680 2>&1) || fail "clean for dataDir test: $out"
+  [[ ! -e "$dwt/.writer-data" ]] || fail "clean must remove the tool's dataDir, including its contents"
+  [[ -d "$dwt" ]] || fail "clean must keep the worktree"
+  out=$(w teardown review-pr-4680 --force 2>&1) || fail "teardown after dataDir test: $out"
+  rm -f "$cfg"
+  pass "clean: removes a tool's dataDir and everything in it"
 
   echo "wt test: $passes groups passed"
 }

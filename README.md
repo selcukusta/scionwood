@@ -225,7 +225,7 @@ Six keys. Everything optional — with no config at all, `wt new spike-auth` wor
   "tools": {
     "codegraph": {
       "detect": "codegraph",
-      "dataDir": ".codegraph-{name}",
+      "dataDir": ".codegraph",
       "env": {
         "CODEGRAPH_PROJECT_PATH": "{worktree}",
         "CODEGRAPH_DATA_DIR": "{dataDir}"
