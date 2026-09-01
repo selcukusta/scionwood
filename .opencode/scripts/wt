@@ -206,12 +206,17 @@ untracked_now() { # $1 worktree; one path per line, directories collapsed
   git -C "$1" status --porcelain 2>/dev/null | awk '$1 == "??" { print substr($0, 4) }' | sed 's:/$::'
 }
 
+modified_now() { # $1 worktree; tracked files with unstaged or staged changes
+  git -C "$1" status --porcelain 2>/dev/null \
+    | awk '$1 != "??" { print substr($0, 4) }' | sed 's:/$::'
+}
+
 # Record whatever bootstrap caused to exist. Tools create artifacts they never
 # declare -- codegraph writes .codegraph/ alongside the dataDir it was told to
 # use -- so listing them per tool would always be one step behind. Diffing the
 # untracked set across bootstrap catches them all, whatever produced them.
-record_artifacts() { # $1 worktree, $2 newline-separated "before" snapshot
-  local wt="$1" before="$2" af line
+record_artifacts() { # $1 worktree, $2 untracked-before, $3 modified-before
+  local wt="$1" before="$2" mbefore="$3" af mf line h
   af="$(artifacts_file "$wt")" || return 0
   mkdir -p "$(dirname "$af")"
   while IFS= read -r line; do
@@ -219,6 +224,19 @@ record_artifacts() { # $1 worktree, $2 newline-separated "before" snapshot
     grep -Fxq "$line" <<<"$before" && continue
     grep -Fxq "$line" "$af" 2>/dev/null || echo "$line" >> "$af"
   done < <(untracked_now "$wt")
+
+  # A hook that runs `npm install` rewrites package-lock.json -- a tracked file
+  # the tool modified, not the user. Record the content hash as it stands after
+  # bootstrap: if it still matches at teardown, bootstrap did it and nobody has
+  # touched it since; if it differs, the user changed it and it counts.
+  mf="${af}-modified"
+  : > "$mf"
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    grep -Fxq "$line" <<<"$mbefore" && continue
+    h="$(git -C "$wt" hash-object "$line" 2>/dev/null)" || continue
+    echo "$h $line" >> "$mf"
+  done < <(modified_now "$wt")
   return 0
 }
 
@@ -237,8 +255,17 @@ wt_own_paths() { # $1 worktree
     [[ -n "$d" ]] || continue
     case "$d" in "$1"/*) echo "${d#$1/}" ;; esac
   done < <(tools_data_dirs "$1")
-  local af
+  local af mf h line
   af="$(artifacts_file "$1" 2>/dev/null)" && [[ -f "$af" ]] && cat "$af"
+  # a tracked file counts as ours only while its content is exactly what
+  # bootstrap left behind
+  mf="${af}-modified"
+  if [[ -n "${af:-}" && -f "$mf" ]]; then
+    while IFS=' ' read -r h line; do
+      [[ -n "$line" ]] || continue
+      [[ "$(git -C "$1" hash-object "$line" 2>/dev/null)" == "$h" ]] && echo "$line"
+    done < "$mf"
+  fi
   return 0
 }
 
@@ -288,11 +315,12 @@ tools_run() { # $1 phase (setup|teardown), $2 worktree
 
 bootstrap_dir() {
   local wt="$1"
-  local main_root name f d before_untracked
+  local main_root name f d before_untracked before_modified
   main_root="$(main_root_from "$wt")" || die "could not locate main repository root above $wt"
   load_config "$main_root"
   name="$(basename "$wt")"
   before_untracked="$(untracked_now "$wt")"
+  before_modified="$(modified_now "$wt")"
 
   while IFS= read -r f; do
     [[ -n "$f" ]] || continue
@@ -313,7 +341,7 @@ bootstrap_dir() {
 
   tools_run setup "$wt"
 
-  record_artifacts "$wt" "$before_untracked"
+  record_artifacts "$wt" "$before_untracked" "$before_modified"
   echo "  bootstrap complete: $wt"
 }
 
@@ -979,12 +1007,24 @@ cmd_teardown() {
       done <<< "$dirty"
       dirty="${filtered%$'\n'}"
     fi
-    # git marks the current branch with '*' and any branch checked out in a
-    # linked worktree with '+'. The branch being torn down always carries '+',
-    # so both prefixes must be stripped or every teardown looks unmerged.
-    if [[ -n "$b" ]] && ! git -C "$main_root" branch --merged HEAD 2>/dev/null \
-        | sed 's/^[*+ ]*//' | grep -Fxq "$b"; then
-      unmerged="$b"
+    # The question is "would deleting this branch lose commits?", not "is it
+    # merged into whatever I happen to have checked out". A worktree branched
+    # from origin/main is not reachable from a local HEAD that sits elsewhere,
+    # yet deleting it loses nothing. Count commits reachable from the branch and
+    # from no other ref.
+    if [[ -n "$b" ]]; then
+      local only others
+      # `--exclude=<ref> --all` does NOT filter the ref out here, so build the
+      # "everything except this branch" set explicitly.
+      others="$(git -C "$main_root" for-each-ref --format='%(refname)' \
+        | grep -vFx "refs/heads/$b" || true)"
+      if [[ -n "$others" ]]; then
+        only="$(git -C "$main_root" rev-list --count "$b" --not $others 2>/dev/null || echo 0)"
+      else
+        only="$(git -C "$main_root" rev-list --count "$b" 2>/dev/null || echo 0)"
+      fi
+      [[ "${only:-0}" -gt 0 ]] \
+        && unmerged="'$b' has $only commit(s) that exist nowhere else -- deleting it would lose them"
     fi
     if [[ -n "$dirty" || -n "$unmerged" ]]; then
       echo "wt: error: refusing to tear down $wt" >&2
@@ -993,7 +1033,7 @@ cmd_teardown() {
         printf '%s\n' "$dirty" | sed 's/^/    /' >&2
       fi
       if [[ -n "$unmerged" ]]; then
-        echo "  branch '$unmerged' has unmerged commits (not reachable from HEAD of $main_root)" >&2
+        echo "  branch $unmerged" >&2
       fi
       echo "  commit your work first, or re-run with --force to discard it" >&2
       exit 1
@@ -1288,7 +1328,7 @@ IGNORE
   git -C "$repo/.git-worktrees/review-pr-7890" add file.txt
   git -C "$repo/.git-worktrees/review-pr-7890" -c user.email=t@t -c user.name=t commit -qm "unmerged work"
   out=$(w teardown review-pr-7890 2>&1) && fail "teardown deleted a branch with unmerged commits without --force"
-  grep -q "unmerged" <<<"$out" || fail "refusal should mention unmerged commits, got: $out"
+  grep -q "nowhere else" <<<"$out" || fail "refusal should say the commits exist nowhere else, got: $out"
   [[ -d "$repo/.git-worktrees/review-pr-7890" ]] || fail "refused teardown still removed the worktree"
   out=$(w teardown review-pr-7890 --force 2>&1) || fail "teardown --force with unmerged commits: $out"
   [[ ! -d "$repo/.git-worktrees/review-pr-7890" ]] || fail "--force did not remove the worktree"
@@ -1636,6 +1676,30 @@ HOOK
   out=$(w teardown review-pr-4680 --force 2>&1) || fail "teardown after dataDir test: $out"
   rm -f "$cfg"
   pass "clean: removes a tool's dataDir and everything in it"
+
+  # a hook that rewrites a TRACKED file (npm install touching package-lock.json)
+  # must not block teardown -- but the moment the user changes it further, it must.
+  jq -n '{tools:{"!codegraph":true}, hooks:{postCreate:"echo rewritten >> file.txt"}}' > "$cfg"
+  out=$(w new review-pr-1357 --pr 1357 2>&1) || fail "new for tracked-file test: $out"
+  local twt="$repo/.git-worktrees/review-pr-1357"
+  git -C "$twt" status --porcelain | grep -q "file.txt" || fail "fixture: the hook did not modify a tracked file"
+  out=$(w teardown review-pr-1357 2>&1) \
+    || fail "a tracked file the hook rewrote must not block teardown: $out"
+
+  out=$(w new review-pr-2468 --pr 2468 2>&1) || fail "new for tracked-file-then-edited test: $out"
+  echo "the user's own edit" >> "$repo/.git-worktrees/review-pr-2468/file.txt"
+  out=$(w teardown review-pr-2468 2>&1) \
+    && fail "teardown ignored a user edit on top of what the hook wrote"
+  grep -q "file.txt" <<<"$out" || fail "refusal should name the file, got: $out"
+  out=$(w teardown review-pr-2468 --force 2>&1) || fail "teardown --force after tracked-file test: $out"
+
+  # a branch that exists only as a copy of another ref loses nothing when deleted
+  jq -n '{tools:{"!codegraph":true}}' > "$cfg"
+  out=$(w new review-pr-3579 --pr 3579 2>&1) || fail "new for nothing-unique test: $out"
+  out=$(w teardown review-pr-3579 2>&1) \
+    || fail "a branch with no unique commits must not be reported as unmerged: $out"
+  rm -f "$cfg"
+  pass "teardown: hook-rewritten tracked files pass, user edits and unique commits do not"
 
   echo "wt test: $passes groups passed"
 }
