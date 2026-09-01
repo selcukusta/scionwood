@@ -1127,7 +1127,7 @@ IGNORE
   [[ "$(git -C "$repo/$CFG_BASE_PATH/review-pr-1234" branch --show-current)" == "wt/review-pr-1234" ]] || fail "expected branch wt/review-pr-1234"
   [[ -L "$repo/$CFG_BASE_PATH/review-pr-1234/.env" ]] || fail ".env not symlinked"
   [[ "$(readlink "$repo/$CFG_BASE_PATH/review-pr-1234/.env")" == "$repo/.env" ]] || fail ".env symlink target wrong"
-  [[ -d "$repo/$CFG_BASE_PATH/review-pr-1234/.codegraph-review-pr-1234" ]] || fail "codegraph data dir missing (env contract broken)"
+  [[ -d "$repo/$CFG_BASE_PATH/review-pr-1234/.codegraph" ]] || fail "codegraph data dir missing (env contract broken)"
   pass "new: --pr worktree, branch wt/review-pr-1234, symlinks, codegraph env contract"
 
   out=$(w list 2>&1) || fail "list: $out"
@@ -1207,7 +1207,7 @@ IGNORE
   rm -f "$tmp/codegraph_called"
   out=$(w new review-pr-2345 --pr 2345 2>&1) || fail "new (codegraph removed): $out"
   [[ -d "$repo/.git-worktrees/review-pr-2345" ]] || fail "worktree not created with codegraph removed"
-  [[ ! -e "$repo/.git-worktrees/review-pr-2345/.codegraph-review-pr-2345" ]] || fail "codegraph data dir created despite removal"
+  [[ ! -e "$repo/.git-worktrees/review-pr-2345/.codegraph" ]] || fail "codegraph data dir created despite removal"
   [[ ! -f "$tmp/codegraph_called" ]] || fail "codegraph binary invoked despite removal"
   pass "config: !name removes an inherited tool"
 
