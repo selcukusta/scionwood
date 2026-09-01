@@ -5,34 +5,89 @@ import path from "node:path"
 const SCRIPT_REL = ".opencode/scripts/wt"
 const CONFIG_REL = path.join(".opencode", "wt.json")
 
-// Mirrors the post-phase-2 bash schema (defaults match bash's built-in defaults)
+// Mirrors the 0.2.0 bash schema (defaults match bash's built-in defaults)
+export type ToolSpec = {
+  detect?: string
+  dataDir?: string
+  env?: Record<string, string>
+  setup?: string
+  teardown?: string
+}
+
 export type Config = {
   basePath: string
   branchPrefix: string
-  namePattern: string
-  fetchPrune: boolean
-  pullRebase: boolean
+  prRef: string
   filesToLink: string[]
-  npmInstallDirs: string[]
-  tools: { codegraph: { enabled: boolean } }
+  hooks: { postCreate?: string; preTeardown?: string }
+  tools: Record<string, ToolSpec>
 }
 
 export const DEFAULT_CONFIG: Config = {
   basePath: ".git-worktrees",
   branchPrefix: "review/",
-  namePattern: "^review-pr-([0-9]+)$",
-  fetchPrune: true,
-  pullRebase: true,
+  prRef: "pull/{n}/head",
   filesToLink: ["CLAUDE.local.md", ".claude/settings.local.json", ".env"],
-  npmInstallDirs: [".", "apps/frontend"],
-  tools: { codegraph: { enabled: true } },
+  hooks: {},
+  tools: {
+    codegraph: {
+      detect: "codegraph",
+      dataDir: ".codegraph-{name}",
+      env: { CODEGRAPH_PROJECT_PATH: "{worktree}", CODEGRAPH_DATA_DIR: "{dataDir}" },
+      setup: "codegraph init -i && codegraph sync",
+    },
+  },
+}
+
+/** Substitute {placeholders}. An unknown placeholder is left as-is so a typo is
+ *  visible in the output rather than silently becoming an empty string. */
+export function expandTemplate(tpl: string, vars: Record<string, string>): string {
+  return tpl.replace(/\{(\w+)\}/g, (whole, key) => (key in vars ? vars[key] : whole))
+}
+
+function varsForTool(spec: ToolSpec, vars: Record<string, string>): Record<string, string> {
+  if (!spec.dataDir) return vars
+  return { ...vars, dataDir: path.join(vars.worktree ?? "", expandTemplate(spec.dataDir, vars)) }
+}
+
+/** Every configured tool's env, expanded and merged. */
+export function toolEnv(
+  tools: Record<string, ToolSpec>,
+  vars: Record<string, string>,
+): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const spec of Object.values(tools ?? {})) {
+    if (!spec?.env) continue
+    const v = varsForTool(spec, vars)
+    for (const [k, tpl] of Object.entries(spec.env)) out[k] = expandTemplate(tpl, v)
+  }
+  return out
+}
+
+/** Env for the tool this MCP server belongs to, matched by tool key against the
+ *  server's name or command. Returns undefined when no tool claims it. */
+export function mcpEnvFor(
+  serverName: string,
+  serverCommand: string,
+  tools: Record<string, ToolSpec>,
+  vars: Record<string, string>,
+): Record<string, string> | undefined {
+  for (const [key, spec] of Object.entries(tools ?? {})) {
+    const k = key.toLowerCase()
+    if (!serverName.toLowerCase().includes(k) && !serverCommand.toLowerCase().includes(k)) continue
+    if (!spec?.env) return {}
+    const v = varsForTool(spec, vars)
+    const out: Record<string, string> = {}
+    for (const [ek, tpl] of Object.entries(spec.env)) out[ek] = expandTemplate(tpl, v)
+    return out
+  }
+  return undefined
 }
 
 type WorktreeInfo = {
   name: string
   root: string
   mainRoot: string
-  codegraphDataDir: string
 }
 
 type Logger = (
@@ -41,22 +96,6 @@ type Logger = (
   extra?: Record<string, unknown>,
 ) => Promise<void>
 
-export function parseBool(value: string | undefined, fallback: boolean): boolean {
-  if (value === undefined) return fallback
-  switch (value.trim().toLowerCase()) {
-    case "true":
-    case "yes":
-    case "1":
-      return true
-    case "false":
-    case "no":
-    case "0":
-      return false
-    default:
-      return fallback
-  }
-}
-
 export function normalizeBasePath(p: string): string {
   return p.replace(/\/+$/, "").replace(/^\.\//, "")
 }
@@ -64,10 +103,8 @@ export function normalizeBasePath(p: string): string {
 export function loadConfig(mainRoot: string, log?: Logger): Config {
   const config: Config = {
     ...DEFAULT_CONFIG,
-    tools: {
-      ...DEFAULT_CONFIG.tools,
-      codegraph: { ...DEFAULT_CONFIG.tools.codegraph },
-    },
+    hooks: { ...DEFAULT_CONFIG.hooks },
+    tools: JSON.parse(JSON.stringify(DEFAULT_CONFIG.tools)) as Record<string, ToolSpec>,
   }
   const cfgPath = path.join(mainRoot, CONFIG_REL)
   if (existsSync(cfgPath)) {
@@ -75,14 +112,10 @@ export function loadConfig(mainRoot: string, log?: Logger): Config {
       const raw = JSON.parse(readFileSync(cfgPath, "utf8")) as Partial<Config>
       config.basePath = typeof raw.basePath === "string" ? raw.basePath : config.basePath
       config.branchPrefix = typeof raw.branchPrefix === "string" ? raw.branchPrefix : config.branchPrefix
-      config.namePattern = typeof raw.namePattern === "string" ? raw.namePattern : config.namePattern
-      config.fetchPrune = typeof raw.fetchPrune === "boolean" ? raw.fetchPrune : config.fetchPrune
-      config.pullRebase = typeof raw.pullRebase === "boolean" ? raw.pullRebase : config.pullRebase
+      config.prRef = typeof raw.prRef === "string" ? raw.prRef : config.prRef
       config.filesToLink = Array.isArray(raw.filesToLink) ? raw.filesToLink : config.filesToLink
-      config.npmInstallDirs = Array.isArray(raw.npmInstallDirs) ? raw.npmInstallDirs : config.npmInstallDirs
-      if (raw.tools && typeof raw.tools.codegraph?.enabled === "boolean") {
-        config.tools.codegraph.enabled = raw.tools.codegraph.enabled
-      }
+      if (raw.hooks && typeof raw.hooks === "object") config.hooks = { ...config.hooks, ...raw.hooks }
+      if (raw.tools && typeof raw.tools === "object") config.tools = { ...config.tools, ...raw.tools }
     } catch (e: any) {
       void log?.("warn", `invalid ${CONFIG_REL}; using defaults`, { error: String(e?.message ?? e) })
     }
@@ -90,10 +123,7 @@ export function loadConfig(mainRoot: string, log?: Logger): Config {
   // env beats file beats defaults
   if (process.env.WT_BASE !== undefined) config.basePath = process.env.WT_BASE
   if (process.env.WT_BRANCH_PREFIX !== undefined) config.branchPrefix = process.env.WT_BRANCH_PREFIX
-  if (process.env.WT_NAME_PATTERN !== undefined) config.namePattern = process.env.WT_NAME_PATTERN
-  if (process.env.WT_FETCH_PRUNE !== undefined) config.fetchPrune = parseBool(process.env.WT_FETCH_PRUNE, config.fetchPrune)
-  if (process.env.WT_PULL_REBASE !== undefined) config.pullRebase = parseBool(process.env.WT_PULL_REBASE, config.pullRebase)
-  if (process.env.WT_CODEGRAPH !== undefined) config.tools.codegraph.enabled = parseBool(process.env.WT_CODEGRAPH, config.tools.codegraph.enabled)
+  if (process.env.WT_PR_REF !== undefined) config.prRef = process.env.WT_PR_REF
   return config
 }
 
@@ -243,28 +273,29 @@ export const SprigWorktreePlugin: Plugin = async ({ client, directory }) => {
     }
   }
 
-  const codegraphEnabled = config.tools.codegraph.enabled
-  const info: WorktreeInfo = {
-    ...wt,
-    mainRoot,
-    codegraphDataDir: codegraphEnabled ? path.join(wt.root, `.codegraph-${wt.name}`) : "",
-  }
+  const info: WorktreeInfo = { ...wt, mainRoot }
 
-  if (codegraphEnabled) {
-    process.env.CODEGRAPH_PROJECT_PATH = info.root
-    process.env.CODEGRAPH_DATA_DIR = info.codegraphDataDir
+  // Every configured tool's env, expanded once. Adding a tool is config only:
+  // nothing here names a specific tool.
+  const templateVars: Record<string, string> = {
+    name: info.name,
+    worktree: info.root,
+    mainRoot: info.mainRoot,
+    dataDir: "",
   }
-  // (else: leave process.env alone — bash gates codegraph internally too)
+  const env = toolEnv(config.tools, templateVars)
+  for (const [k, v] of Object.entries(env)) process.env[k] = v
 
   const ready = runScript(directory, ["bootstrap", info.root]).then(async (r) => {
     if (r.code !== 0) {
       await log("warn", "bootstrap failed", { output: r.output.slice(-500) })
       return
     }
-    await log("info", "bootstrap complete", codegraphEnabled ? { dataDir: info.codegraphDataDir } : { codegraph: "disabled" })
+    const toolNames = Object.keys(config.tools ?? {})
+    await log("info", "bootstrap complete", { tools: toolNames })
     try {
       await client.tui.showToast({
-        body: { message: `worktree ${info.name}: bootstrap complete${codegraphEnabled ? "" : " (codegraph disabled)"}`, variant: "success" },
+        body: { message: `worktree ${info.name}: bootstrap complete`, variant: "success" },
       })
     } catch {}
   })
@@ -273,18 +304,12 @@ export const SprigWorktreePlugin: Plugin = async ({ client, directory }) => {
   return {
     config: async (cfg) => {
       cfg.mcp = cfg.mcp ?? {}
-      if (codegraphEnabled) {
-        for (const [name, server] of Object.entries(cfg.mcp)) {
-          if (!server || server.type !== "local") continue
-          const cmd = Array.isArray(server.command) ? server.command.join(" ") : ""
-          if (name.toLowerCase().includes("codegraph") || cmd.includes("codegraph")) {
-            server.environment = {
-              CODEGRAPH_PROJECT_PATH: info.root,
-              CODEGRAPH_DATA_DIR: info.codegraphDataDir,
-              ...server.environment,
-            }
-          }
-        }
+      for (const [name, server] of Object.entries(cfg.mcp)) {
+        if (!server || server.type !== "local") continue
+        const cmd = Array.isArray(server.command) ? server.command.join(" ") : ""
+        const injected = mcpEnvFor(name, cmd, config.tools, templateVars)
+        if (!injected) continue
+        server.environment = { ...injected, ...server.environment }
       }
       cfg.permission = cfg.permission ?? {}
       const perm = cfg.permission as unknown as { external_directory?: Record<string, "ask" | "allow" | "deny"> }
@@ -294,10 +319,7 @@ export const SprigWorktreePlugin: Plugin = async ({ client, directory }) => {
       }
     },
     "shell.env": async (_input, output) => {
-      if (codegraphEnabled) {
-        output.env.CODEGRAPH_PROJECT_PATH = info.root
-        output.env.CODEGRAPH_DATA_DIR = info.codegraphDataDir
-      }
+      for (const [k, v] of Object.entries(env)) output.env[k] = v
     },
     event: async ({ event }) => {
       if (event.type !== "session.deleted") return
@@ -315,7 +337,6 @@ export const SprigWorktreePlugin: Plugin = async ({ client, directory }) => {
       if (!shouldClean(sessions, deletedId, directory)) return
       const r = await runScript(directory, ["clean", info.root])
       await log(r.code === 0 ? "info" : "warn", "worktree artifacts cleaned", {
-        ...(codegraphEnabled ? { dataDir: info.codegraphDataDir } : {}),
         ...(r.code === 0 ? {} : { output: r.output.slice(-500) }),
       })
     },

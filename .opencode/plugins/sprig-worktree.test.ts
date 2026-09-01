@@ -3,13 +3,15 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import path from "node:path"
 import os from "node:os"
 import {
-  parseBool,
   normalizeBasePath,
   loadConfig,
   parseWorktree,
   findMainRepoRoot,
   shouldClean,
   resolveScriptPath,
+  expandTemplate,
+  toolEnv,
+  mcpEnvFor,
   DEFAULT_CONFIG,
 } from "./sprig-worktree.ts"
 
@@ -67,41 +69,6 @@ function writeConfig(mainRoot: string, contents: string): string {
 // parseBool — exhaustive truthy/falsy/fallback
 // ---------------------------------------------------------------------------
 
-describe("parseBool", () => {
-  test("truthy spellings (case-insensitive)", () => {
-    for (const v of ["true", "TRUE", "True", "yes", "YES", "1"]) {
-      expect(parseBool(v, false)).toBe(true)
-    }
-  })
-
-  test("falsy spellings (case-insensitive)", () => {
-    for (const v of ["false", "FALSE", "False", "no", "No", "0"]) {
-      expect(parseBool(v, true)).toBe(false)
-    }
-  })
-
-  test("unknown spellings fall back (never crash)", () => {
-    for (const v of ["", "maybe", "2", "off"]) {
-      expect(parseBool(v, true)).toBe(true)
-      expect(parseBool(v, false)).toBe(false)
-    }
-  })
-
-  test("undefined falls back", () => {
-    expect(parseBool(undefined, true)).toBe(true)
-    expect(parseBool(undefined, false)).toBe(false)
-  })
-
-  test("trims surrounding whitespace", () => {
-    expect(parseBool("  true  ", false)).toBe(true)
-    expect(parseBool("\tNO\n", true)).toBe(false)
-  })
-})
-
-// ---------------------------------------------------------------------------
-// normalizeBasePath — path normalization
-// ---------------------------------------------------------------------------
-
 describe("normalizeBasePath", () => {
   test("already-normalized paths pass through", () => {
     expect(normalizeBasePath(".git-worktrees")).toBe(".git-worktrees")
@@ -147,8 +114,8 @@ describe("loadConfig", () => {
     const cfg = loadConfig(tmp)
     expect(cfg.basePath).toBe(".wt-trees")
     expect(cfg.branchPrefix).toBe(DEFAULT_CONFIG.branchPrefix)
-    expect(cfg.fetchPrune).toBe(DEFAULT_CONFIG.fetchPrune)
-    expect(cfg.tools.codegraph.enabled).toBe(DEFAULT_CONFIG.tools.codegraph.enabled)
+    expect(cfg.prRef).toBe(DEFAULT_CONFIG.prRef)
+    expect(cfg.tools.codegraph.detect).toBe(DEFAULT_CONFIG.tools.codegraph.detect)
     expect(cfg).toEqual({ ...DEFAULT_CONFIG, basePath: ".wt-trees" })
   })
 
@@ -157,15 +124,21 @@ describe("loadConfig", () => {
     const full = {
       basePath: ".wt-trees",
       branchPrefix: "pr/",
-      namePattern: "^pr-([0-9]+)$",
-      fetchPrune: false,
-      pullRebase: false,
+      prRef: "merge-requests/{n}/head",
       filesToLink: [".env"],
-      npmInstallDirs: ["apps/api"],
-      tools: { codegraph: { enabled: false } },
+      hooks: { postCreate: ".opencode/hooks/post-create.sh" },
+      tools: { ctags: { detect: "ctags", setup: "ctags -R" } },
     }
     writeConfig(tmp, JSON.stringify(full))
-    expect(loadConfig(tmp)).toEqual(full)
+    const cfg = loadConfig(tmp)
+    expect(cfg.basePath).toBe(".wt-trees")
+    expect(cfg.branchPrefix).toBe("pr/")
+    expect(cfg.prRef).toBe("merge-requests/{n}/head")
+    expect(cfg.filesToLink).toEqual([".env"])
+    expect(cfg.hooks).toEqual({ postCreate: ".opencode/hooks/post-create.sh" })
+    // tools merge by key against the defaults, matching the bash merge semantics
+    expect(cfg.tools.ctags).toEqual({ detect: "ctags", setup: "ctags -R" })
+    expect(cfg.tools.codegraph).toEqual(DEFAULT_CONFIG.tools.codegraph)
   })
 
   test("malformed JSON warns via logger and falls back to DEFAULT_CONFIG", () => {
@@ -182,11 +155,12 @@ describe("loadConfig", () => {
 
   test("type-mismatched fields are rejected and fall back", () => {
     const tmp = makeTmp()
-    writeConfig(tmp, JSON.stringify({ basePath: 123, fetchPrune: "yes", tools: { codegraph: { enabled: "0" } } }))
+    writeConfig(tmp, JSON.stringify({ basePath: 123, prRef: 7, filesToLink: "nope", hooks: "nope" }))
     const cfg = loadConfig(tmp)
     expect(cfg.basePath).toBe(DEFAULT_CONFIG.basePath)
-    expect(cfg.fetchPrune).toBe(DEFAULT_CONFIG.fetchPrune)
-    expect(cfg.tools.codegraph.enabled).toBe(DEFAULT_CONFIG.tools.codegraph.enabled)
+    expect(cfg.prRef).toBe(DEFAULT_CONFIG.prRef)
+    expect(cfg.filesToLink).toEqual(DEFAULT_CONFIG.filesToLink)
+    expect(cfg.hooks).toEqual(DEFAULT_CONFIG.hooks)
   })
 
   test("WT_BASE env overrides file value", () => {
@@ -196,33 +170,21 @@ describe("loadConfig", () => {
     expect(loadConfig(tmp).basePath).toBe(".env-base")
   })
 
-  test("WT_FETCH_PRUNE env parses false/true over file value", () => {
+  test("WT_PR_REF env overrides file value", () => {
     const tmp = makeTmp()
-    writeConfig(tmp, JSON.stringify({ fetchPrune: true }))
-    process.env.WT_FETCH_PRUNE = "false"
-    expect(loadConfig(tmp).fetchPrune).toBe(false)
-    process.env.WT_FETCH_PRUNE = "no"
-    expect(loadConfig(tmp).fetchPrune).toBe(false)
-  })
-
-  test("WT_CODEGRAPH env disables codegraph with 0/false/no", () => {
-    const tmp = makeTmp()
-    for (const v of ["0", "false", "no"]) {
-      process.env.WT_CODEGRAPH = v
-      expect(loadConfig(tmp).tools.codegraph.enabled).toBe(false)
-    }
-    process.env.WT_CODEGRAPH = "1"
-    expect(loadConfig(tmp).tools.codegraph.enabled).toBe(true)
+    writeConfig(tmp, JSON.stringify({ prRef: "pull/{n}/head" }))
+    process.env.WT_PR_REF = "merge-requests/{n}/head"
+    expect(loadConfig(tmp).prRef).toBe("merge-requests/{n}/head")
   })
 
   test("unset env vars have no effect", () => {
     const tmp = makeTmp()
     writeConfig(tmp, JSON.stringify({ basePath: ".wt-trees" }))
     delete process.env.WT_BASE
-    delete process.env.WT_CODEGRAPH
+    delete process.env.WT_PR_REF
     const cfg = loadConfig(tmp)
     expect(cfg.basePath).toBe(".wt-trees")
-    expect(cfg.tools.codegraph.enabled).toBe(true)
+    expect(cfg.prRef).toBe(DEFAULT_CONFIG.prRef)
   })
 })
 
@@ -380,5 +342,54 @@ describe("zero-token guarantee", () => {
   test("ships no slash commands", () => {
     expect(existsSync(path.join(import.meta.dir, "..", "commands"))).toBe(false)
     expect(existsSync(path.join(import.meta.dir, "..", "command"))).toBe(false)
+  })
+})
+
+describe("expandTemplate", () => {
+  const vars = { name: "pr-1", worktree: "/w/pr-1", mainRoot: "/w", dataDir: "/w/pr-1/.cg" }
+
+  test("substitutes every placeholder", () => {
+    expect(expandTemplate("{worktree}/{name}", vars)).toBe("/w/pr-1/pr-1")
+  })
+
+  test("leaves unknown placeholders alone rather than emptying them", () => {
+    expect(expandTemplate("{nope}", vars)).toBe("{nope}")
+  })
+})
+
+describe("toolEnv", () => {
+  const vars = { name: "pr-1", worktree: "/w/pr-1", mainRoot: "/w", dataDir: "" }
+
+  test("expands each tool's env and merges across tools", () => {
+    const tools = {
+      codegraph: { dataDir: ".cg-{name}", env: { CG_ROOT: "{worktree}", CG_DATA: "{dataDir}" } },
+      docker: { env: { COMPOSE_PROJECT_NAME: "wt-{name}" } },
+    }
+    expect(toolEnv(tools, vars)).toEqual({
+      CG_ROOT: "/w/pr-1",
+      CG_DATA: "/w/pr-1/.cg-pr-1",
+      COMPOSE_PROJECT_NAME: "wt-pr-1",
+    })
+  })
+
+  test("a tool with no env contributes nothing", () => {
+    expect(toolEnv({ ctags: { setup: "ctags -R" } }, vars)).toEqual({})
+  })
+})
+
+describe("mcpEnvFor", () => {
+  const vars = { name: "pr-1", worktree: "/w/pr-1", mainRoot: "/w", dataDir: "" }
+  const tools = { codegraph: { dataDir: ".cg-{name}", env: { CG_DATA: "{dataDir}" } } }
+
+  test("matches an MCP server by name", () => {
+    expect(mcpEnvFor("codegraph", "", tools, vars)).toEqual({ CG_DATA: "/w/pr-1/.cg-pr-1" })
+  })
+
+  test("matches an MCP server by command", () => {
+    expect(mcpEnvFor("graph", "npx codegraph-mcp", tools, vars)).toEqual({ CG_DATA: "/w/pr-1/.cg-pr-1" })
+  })
+
+  test("returns undefined for an unrelated server", () => {
+    expect(mcpEnvFor("postgres", "psql", tools, vars)).toBeUndefined()
   })
 })
