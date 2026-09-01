@@ -1,0 +1,32 @@
+name: Bug report
+description: Something behaved differently from what the docs say
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: The command you ran and what it did. Paste the output.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected instead
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `wt --version` (it prints which wt is running, which matters if you have more than one)
+      placeholder: scionwood 0.1.0
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Effective config
+      description: Output of `wt config --layers`, which shows where each value came from
+      render: json
