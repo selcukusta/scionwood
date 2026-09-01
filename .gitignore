@@ -4,6 +4,7 @@
 !.opencode/**
 node_modules/
 .codegraph*
+.git-worktrees/
 .claude/worktrees/
 *.log
 dist/

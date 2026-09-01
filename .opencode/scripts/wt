@@ -157,6 +157,23 @@ tool_expand() { # $1 tool, $2 template, $3 worktree
   printf '%s' "$tpl"
 }
 
+# Paths wt created inside the worktree: the symlinks it made and each tool's
+# data dir. These are artifacts of the tool, not the user's work, so the
+# teardown safety check must not count them as uncommitted changes -- otherwise
+# linking a file that is not gitignored makes every teardown refuse forever.
+wt_own_paths() { # $1 worktree
+  local f d
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    [[ -L "$1/$f" ]] && echo "$f"
+  done < <(cfg_list '.filesToLink')
+  while IFS= read -r d; do
+    [[ -n "$d" ]] || continue
+    case "$d" in "$1"/*) echo "${d#$1/}" ;; esac
+  done < <(tools_data_dirs "$1")
+  return 0
+}
+
 tools_data_dirs() { # $1 worktree
   local t d
   while IFS= read -r t; do
@@ -752,8 +769,25 @@ cmd_teardown() {
   b="${branch#refs/heads/}"
 
   if ! $force; then
-    local dirty unmerged=""
+    local dirty unmerged="" own
     dirty="$(git -C "$wt" status --porcelain 2>/dev/null || true)"
+    own="$(wt_own_paths "$wt")"
+    if [[ -n "$dirty" && -n "$own" ]]; then
+      local filtered="" line path o keep
+      while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        path="${line:3}"          # strip the two status chars and the space
+        path="${path#\"}"; path="${path%\"}"
+        path="${path%/}"          # untracked directories come with a trailing /
+        keep=1
+        while IFS= read -r o; do
+          [[ -n "$o" ]] || continue
+          if [[ "$path" == "$o" ]]; then keep=0; break; fi
+        done <<< "$own"
+        [[ $keep -eq 1 ]] && filtered+="$line"$'\n'
+      done <<< "$dirty"
+      dirty="${filtered%$'\n'}"
+    fi
     # git marks the current branch with '*' and any branch checked out in a
     # linked worktree with '+'. The branch being torn down always carries '+',
     # so both prefixes must be stripped or every teardown looks unmerged.
@@ -840,9 +874,10 @@ STUB
   mkdir -p "$tmp/repo/apps/frontend"
   echo '{}' > "$tmp/repo/package.json"
   echo '{}' > "$tmp/repo/apps/frontend/package.json"
+  # NOTE: CLAUDE.local.md is deliberately absent here. It is a filesToLink
+  # default, so leaving it untracked is what proves the teardown filter works.
   cat > "$tmp/repo/.gitignore" <<'IGNORE'
 .env
-CLAUDE.local.md
 .claude/
 node_modules/
 .codegraph-*
@@ -1284,6 +1319,29 @@ HOOK
 
   rm -f "$cfg"
   pass "new: --pr / --branch / --from / default branch / --no-open"
+
+  # a symlink wt created must not count as the user's uncommitted work.
+  # CLAUDE.local.md is deliberately NOT in the fixture .gitignore, so without
+  # the filter it shows as "?? CLAUDE.local.md" and teardown refuses forever.
+  jq -n '{tools:{"!codegraph":true}, filesToLink:["CLAUDE.local.md",".env"]}' > "$cfg"
+  out=$(w new review-pr-1357 --pr 1357 2>&1) || fail "new for own-artifact test: $out"
+  local owt="$repo/.git-worktrees/review-pr-1357"
+  [[ -L "$owt/CLAUDE.local.md" ]] || fail "fixture: CLAUDE.local.md was not linked"
+  git -C "$owt" status --porcelain | grep -q "CLAUDE.local.md" \
+    || fail "fixture broken: the linked file should be untracked, or this test proves nothing"
+  out=$(w teardown review-pr-1357 2>&1) \
+    || fail "teardown must not be blocked by a symlink wt itself created: $out"
+  [[ ! -d "$owt" ]] || fail "teardown did not remove the worktree"
+
+  # ...but genuine work must still block it
+  out=$(w new review-pr-2468 --pr 2468 2>&1) || fail "new for real-work test: $out"
+  echo "real change" >> "$repo/.git-worktrees/review-pr-2468/file.txt"
+  out=$(w teardown review-pr-2468 2>&1) && fail "teardown ignored a real uncommitted change"
+  grep -q "file.txt" <<<"$out" || fail "refusal should name the changed file, got: $out"
+  out=$(w teardown review-pr-2468 --force 2>&1) || fail "teardown --force after real-work test: $out"
+
+  rm -f "$cfg"
+  pass "teardown: wt's own symlinks are not uncommitted work, real changes still are"
 
   echo "wt test: $passes groups passed"
 }
