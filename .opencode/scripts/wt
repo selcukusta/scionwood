@@ -90,16 +90,52 @@ main_root_from() { # $1 start dir, $2 optional basePath marker (default: CFG_BAS
   return 1
 }
 
-npm_install_dir() {
-  local dir="$1"
-  if [[ ! -f "$dir/package.json" ]]; then
-    echo "  skip  npm install ($(realpath "$dir" 2>/dev/null || echo "$dir")) (no package.json)"
+# Runs a lifecycle hook. The configured value is either a path to an executable
+# file (preferred -- the user edits a real script) or an inline shell command.
+# A missing or non-executable file warns and continues: a hook is a convenience,
+# never a gate on having a usable worktree.
+run_hook() { # $1 phase (postCreate|preTeardown), $2 worktree
+  local phase="$1" wt="$2" spec main_root name branch candidate
+  spec="$(cfg ".hooks.$phase")"
+  [[ -n "$spec" ]] || return 0
+
+  main_root="$(main_root_from "$wt")" || main_root=""
+  name="$(basename "$wt")"
+  branch="$(git -C "$wt" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")"
+
+  candidate="$spec"
+  [[ "$candidate" != /* ]] && candidate="$main_root/$spec"
+
+  if [[ -e "$candidate" ]]; then
+    if [[ ! -x "$candidate" ]]; then
+      echo "wt: warning: hook $phase is not executable: $candidate (chmod +x it)" >&2
+      return 0
+    fi
+    echo "  hook  $phase ($spec)"
+    if ! (cd "$wt" && WT_NAME="$name" WT_ROOT="$wt" WT_MAIN_ROOT="$main_root" WT_BRANCH="$branch" \
+          "$candidate"); then
+      echo "wt: warning: hook $phase failed" >&2
+    fi
     return 0
   fi
-  echo "  npm install ($dir)"
-  if ! (cd "$dir" && npm install --no-fund --no-audit); then
-    echo "wt: warning: npm install failed in $dir" >&2
+
+  # The value does not exist on disk. A bare word that looks like a path is a
+  # missing file -- warn, because silently shell-executing a typo'd path is
+  # worse than doing nothing. Anything containing whitespace is a command: an
+  # inline command frequently contains "/" too, so "/" alone cannot decide.
+  case "$spec" in
+    *[[:space:]]*) ;;
+    *.sh|*/*)
+      echo "wt: warning: hook $phase not found: $candidate" >&2
+      return 0 ;;
+  esac
+
+  echo "  hook  $phase (inline)"
+  if ! (cd "$wt" && WT_NAME="$name" WT_ROOT="$wt" WT_MAIN_ROOT="$main_root" WT_BRANCH="$branch" \
+        bash -c "$spec"); then
+    echo "wt: warning: hook $phase failed" >&2
   fi
+  return 0
 }
 
 tool_names() { jq -r '(.tools // {}) | keys_unsorted[]' <<<"$WT_CONFIG"; }
@@ -193,14 +229,7 @@ bootstrap_dir() {
     echo "  link  $f -> $main_root/$f"
   done < <(cfg_list '.filesToLink')
 
-  while IFS= read -r d; do
-    [[ -n "$d" ]] || continue
-    if [[ "$d" == "." ]]; then
-      npm_install_dir "$wt"
-    else
-      npm_install_dir "$wt/$d"
-    fi
-  done < <(cfg_list '.npmInstallDirs')
+  run_hook postCreate "$wt"
 
   tools_run setup "$wt"
 
@@ -398,7 +427,7 @@ config_defaults_json() {
   "fetchPrune": true,
   "pullRebase": true,
   "filesToLink": ["CLAUDE.local.md", ".claude/settings.local.json", ".env"],
-  "npmInstallDirs": [".", "apps/frontend"],
+  "hooks": {},
   "tools": {
     "codegraph": {
       "detect": "codegraph",
@@ -719,6 +748,8 @@ cmd_teardown() {
   local invoked_from
   invoked_from="$(pwd -P 2>/dev/null || true)"
 
+  run_hook preTeardown "$wt"
+  tools_run teardown "$wt"
   clean_artifacts "$wt"
 
   git -C "$main_root" worktree remove --force "$wt"
@@ -804,6 +835,10 @@ IGNORE
   git -C "$tmp/repo" push -q origin "$default_branch:refs/pull/7890/head"
   git -C "$tmp/repo" push -q origin "$default_branch:refs/pull/8901/head"
   git -C "$tmp/repo" push -q origin "$default_branch:refs/pull/9012/head"
+  git -C "$tmp/repo" push -q origin "$default_branch:refs/pull/1357/head"
+  git -C "$tmp/repo" push -q origin "$default_branch:refs/pull/2468/head"
+  git -C "$tmp/repo" push -q origin "$default_branch:refs/pull/3579/head"
+  git -C "$tmp/repo" push -q origin "$default_branch:refs/pull/4680/head"
 
   export PATH="$tmp/bin:$PATH"
   export WT_OPEN=none
@@ -834,9 +869,7 @@ IGNORE
   [[ -L "$repo/$CFG_BASE_PATH/review-pr-1234/.env" ]] || fail ".env not symlinked"
   [[ "$(readlink "$repo/$CFG_BASE_PATH/review-pr-1234/.env")" == "$repo/.env" ]] || fail ".env symlink target wrong"
   [[ -d "$repo/$CFG_BASE_PATH/review-pr-1234/.codegraph-review-pr-1234" ]] || fail "codegraph data dir missing (env contract broken)"
-  [[ -d "$repo/$CFG_BASE_PATH/review-pr-1234/node_modules" ]] || fail "npm install did not run in root"
-  [[ -d "$repo/$CFG_BASE_PATH/review-pr-1234/apps/frontend/node_modules" ]] || fail "npm install did not run in apps/frontend"
-  pass "new: PR worktree, branch review/review-pr-1234, symlinks, npm install, codegraph env contract"
+  pass "new: PR worktree, branch review/review-pr-1234, symlinks, codegraph env contract"
 
   out=$(w list 2>&1) || fail "list: $out"
   grep -q "review-pr-1234" <<<"$out" || fail "list output missing review-pr-1234"
@@ -1133,6 +1166,48 @@ STUB
 
   rm -f "$cfg"
   pass "tools: env contract, detect gating, dataDir cleanup, escape guard"
+
+  # hooks: file form, inline form, env contract, missing-file tolerance
+  mkdir -p "$repo/.opencode/hooks"
+  cat > "$repo/.opencode/hooks/post-create.sh" <<'HOOK'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$WT_NAME" "$WT_ROOT" "$WT_MAIN_ROOT" "$WT_BRANCH" "$PWD" > .hook-ran
+HOOK
+  chmod +x "$repo/.opencode/hooks/post-create.sh"
+  jq -n '{tools:{"!codegraph":true}, hooks:{postCreate:".opencode/hooks/post-create.sh"}}' > "$cfg"
+
+  out=$(w new review-pr-8901 2>&1) || fail "new with a file hook: $out"
+  local hwt="$repo/.git-worktrees/review-pr-8901"
+  [[ -f "$hwt/.hook-ran" ]] || fail "postCreate hook did not run: $out"
+  [[ "$(sed -n 1p "$hwt/.hook-ran")" == "review-pr-8901" ]] || fail "hook WT_NAME wrong"
+  [[ "$(sed -n 2p "$hwt/.hook-ran")" == "$hwt" ]] || fail "hook WT_ROOT wrong"
+  [[ "$(sed -n 3p "$hwt/.hook-ran")" == "$repo" ]] || fail "hook WT_MAIN_ROOT wrong"
+  [[ "$(sed -n 4p "$hwt/.hook-ran")" == "review/review-pr-8901" ]] || fail "hook WT_BRANCH wrong"
+  [[ "$(sed -n 5p "$hwt/.hook-ran")" == "$hwt" ]] || fail "hook cwd must be the worktree"
+  out=$(w teardown review-pr-8901 --force 2>&1) || fail "teardown after file-hook test: $out"
+
+  jq -n '{tools:{"!codegraph":true}, hooks:{postCreate:"echo inline > .hook-inline"}}' > "$cfg"
+  out=$(w new review-pr-9012 2>&1) || fail "new with an inline hook: $out"
+  [[ "$(cat "$repo/.git-worktrees/review-pr-9012/.hook-inline")" == "inline" ]] || fail "inline hook did not run"
+  out=$(w teardown review-pr-9012 --force 2>&1) || fail "teardown after inline-hook test: $out"
+
+  jq -n '{tools:{"!codegraph":true}, hooks:{postCreate:".opencode/hooks/nope.sh"}}' > "$cfg"
+  out=$(w new review-pr-1357 2>&1) || fail "a missing hook file must not fail worktree creation: $out"
+  [[ -d "$repo/.git-worktrees/review-pr-1357" ]] || fail "worktree not created with a missing hook"
+  grep -qi "warning" <<<"$out" || fail "a missing hook should warn, got: $out"
+  out=$(w teardown review-pr-1357 --force 2>&1) || fail "teardown after missing-hook test: $out"
+
+  # preTeardown runs before the worktree is removed
+  jq -n '{tools:{"!codegraph":true}, hooks:{preTeardown:"touch \"$WT_MAIN_ROOT/.pre-teardown-ran\""}}' > "$cfg"
+  rm -f "$repo/.pre-teardown-ran"
+  out=$(w new review-pr-2468 2>&1) || fail "new for preTeardown test: $out"
+  out=$(w teardown review-pr-2468 --force 2>&1) || fail "teardown with preTeardown hook: $out"
+  [[ -f "$repo/.pre-teardown-ran" ]] || fail "preTeardown hook did not run"
+  rm -f "$repo/.pre-teardown-ran"
+
+  rm -rf "$repo/.opencode/hooks"; rm -f "$cfg"
+  pass "hooks: file form, inline form, env contract, missing file tolerated"
 
   echo "wt test: $passes groups passed"
 }
