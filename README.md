@@ -13,7 +13,7 @@
 
 <p align="center">
   <img src="./assets/demo.gif" width="860"
-       alt="Creating an isolated worktree with its own codegraph index, then teardown refusing to discard an uncommitted change until --force is passed">
+       alt="Fetching pull request 1 into an isolated worktree with its own codegraph index, confirming it holds the PR's commit, then teardown refusing to discard an uncommitted change until --force is passed">
 </p>
 
 ---

@@ -1,14 +1,15 @@
 # Regenerate with:  vhs assets/demo.tape   (run from the repository root)
 #
-# Self-contained: clones this repo into a scratch directory, records the demo
-# there, and cleans up. Re-run it whenever the CLI output changes.
+# Self-contained: clones this repo from GitHub into a scratch directory so a
+# real pull request is fetchable, records, and cleans up. pull/N/head refs
+# persist after a PR is closed, so PR #1 stays fetchable indefinitely.
 
 Output assets/demo.gif
 
 Set Shell bash
 Set FontSize 13
 Set Width 1100
-Set Height 780
+Set Height 720
 Set Padding 18
 Set TypingSpeed 45ms
 Set Theme "Catppuccin Mocha"
@@ -16,48 +17,48 @@ Set Theme "Catppuccin Mocha"
 # --- setup, not recorded -----------------------------------------------------
 Hide
 Type "rm -rf /tmp/scionwood-demo && mkdir -p /tmp/scionwood-demo" Enter
-Type "git clone -q $PWD /tmp/scionwood-demo/scionwood" Enter
+Type "git clone -q https://github.com/selcukusta/scionwood /tmp/scionwood-demo/scionwood" Enter
 Type "cd /tmp/scionwood-demo/scionwood" Enter
 Type "printf 'API_KEY=local-dev-secret\n' > .env" Enter
 Type "printf 'project notes\n' > CLAUDE.local.md" Enter
-Type "export WT_OPEN=none PS1='$ '" Enter
+# GIT_PAGER: vhs gives git a real terminal, so `git log` would open less and
+# swallow every keystroke after it.
+Type "export WT_OPEN=none GIT_PAGER=cat PAGER=cat PS1='$ '" Enter
 Type "clear" Enter
 Show
 
-# --- 1. create an isolated worktree ------------------------------------------
-Type "wt new spike-auth"
+# --- 1. pull someone else's PR into a worktree of its own --------------------
+Type "wt new review --pr 1"
 Sleep 600ms
 Enter
-Sleep 4s
+Sleep 6s
 
-# --- 2. it is a real worktree, on its own branch ------------------------------
-Type "wt list"
+# --- 2. it really is the PR's code, on its own branch ------------------------
+Type "cd .git-worktrees/review && git log --oneline -1"
 Sleep 400ms
 Enter
-Sleep 1500ms
+Sleep 2s
 
-# --- 3. do some work in it ---------------------------------------------------
-Type "cd .git-worktrees/spike-auth"
-Sleep 300ms
-Enter
-Sleep 600ms
-
-Type "echo '// half-finished experiment' >> scripts/build.mjs"
+Type "ls .github/ISSUE_TEMPLATE/"
 Sleep 400ms
 Enter
-Sleep 1s
+Sleep 2s
 
-# --- 4. teardown refuses to throw the work away ------------------------------
+# --- 3. and it will not let you throw work away ------------------------------
+Type "echo '# reviewer note' >> README.md"
+Sleep 400ms
+Enter
+Sleep 800ms
+
 Type "wt teardown"
 Sleep 600ms
 Enter
 Sleep 4s
 
-# --- 5. --force is the deliberate way out ------------------------------------
 Type "wt teardown --force"
 Sleep 600ms
 Enter
-Sleep 4s
+Sleep 3500ms
 
 # --- cleanup, not recorded ---------------------------------------------------
 Hide
