@@ -38,6 +38,7 @@ usage:
                               command and ~/.config/wt/config.json
   wt init [--force]           repository setup: writes <repo>/.opencode/wt.json
   wt test                     run the built-in smoke tests (throwaway repo)
+  wt --version                show the version and which wt you are running
 
 env:
   WT_OPEN=auto|exec|tab|none  how to launch opencode after "new"/"open" (default: auto)
@@ -66,6 +67,18 @@ die() { echo "wt: error: $*" >&2; exit 1; }
 # Fully resolve a path, following symlink chains. macOS ships neither
 # `readlink -f` nor realpath(1), and plain `readlink` returns the raw target,
 # which is often relative -- so comparing its output directly is wrong.
+cmd_version() {
+  local root v
+  root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." 2>/dev/null && pwd -P)" || root=""
+  if [[ -n "$root" && -f "$root/package.json" ]] && command -v jq >/dev/null 2>&1; then
+    v="$(jq -r '.version // empty' "$root/package.json" 2>/dev/null)"
+  fi
+  echo "scionwood ${v:-unknown}"
+  # Print the path too: more than one wt on PATH is a real and confusing
+  # situation, and this is the fastest way to see which one you are running.
+  echo "  cli: $(resolve_path "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
+}
+
 resolve_path() { # $1 path
   local p="$1" d b t
   d="$(cd "$(dirname "$p")" 2>/dev/null && pwd -P)" || return 1
@@ -672,17 +685,42 @@ JSON
   if [[ ! -f "$hooks/post-create.sh" ]] || $force; then
     cat > "$hooks/post-create.sh" <<'HOOK'
 #!/usr/bin/env bash
-# Runs inside a freshly created worktree.
-#   cwd: the worktree
-#   env: WT_NAME  WT_ROOT  WT_MAIN_ROOT  WT_BRANCH
-# Edit freely. A failure here warns but never blocks the worktree.
+# Runs inside a freshly created worktree, right after it is checked out.
+#
+#   cwd: the worktree itself
+#   env: WT_NAME       the worktree name, e.g. spike-auth
+#        WT_ROOT       absolute path to the worktree
+#        WT_MAIN_ROOT  absolute path to the main repository
+#        WT_BRANCH     the branch the worktree is on
+#
+# A worktree is a fresh checkout with no dependencies installed. Put whatever
+# makes it usable here. This is a normal shell script -- edit it freely.
+# If it fails you get a warning, never a broken worktree.
 set -euo pipefail
 
+# The guess below covers a single-package JS repo. Replace it with whatever
+# your project actually needs.
 if   [ -f pnpm-lock.yaml ];    then pnpm install
 elif [ -f bun.lockb ];         then bun install
 elif [ -f yarn.lock ];         then yarn install
 elif [ -f package-lock.json ]; then npm install
 fi
+
+# Examples for other shapes, uncomment what applies:
+#
+#   monorepo, install per package:
+#     pnpm install --frozen-lockfile
+#     (cd apps/frontend && pnpm install)
+#
+#   python:
+#     uv sync            # or: python -m venv .venv && .venv/bin/pip install -e .
+#
+#   go / rust:
+#     go mod download
+#     cargo fetch
+#
+#   copy a local config the repo does not track but the build needs:
+#     cp "$WT_MAIN_ROOT/config.local.toml" .
 HOOK
     chmod +x "$hooks/post-create.sh"
   fi
@@ -691,19 +729,52 @@ HOOK
     cat > "$hooks/pre-teardown.sh" <<'HOOK'
 #!/usr/bin/env bash
 # Runs inside the worktree just before it is removed.
-#   cwd: the worktree
+#
+#   cwd: the worktree itself
 #   env: WT_NAME  WT_ROOT  WT_MAIN_ROOT  WT_BRANCH
-# Stop anything this worktree started. Failures warn but never block teardown.
+#
+# Stop anything this worktree started, so removing the directory does not leave
+# something running. Failures warn but never block teardown.
 set -euo pipefail
 
-# example: docker compose down -v
+# Examples, uncomment what applies:
+#
+#   docker compose down -v
+#   pkill -f "vite --port $PORT" || true
+#   dropdb "myapp_$WT_NAME" || true
 HOOK
     chmod +x "$hooks/pre-teardown.sh"
   fi
 
-  echo "config written:   ${cfg_path#$main_root/}"
-  echo "hooks scaffolded: ${hooks#$main_root/}/post-create.sh, ${hooks#$main_root/}/pre-teardown.sh"
-  echo "the config already points at them -- edit the hooks, not the config"
+  cat <<EOF
+
+config written:   ${cfg_path#$main_root/}
+hooks scaffolded: ${hooks#$main_root/}/post-create.sh
+                  ${hooks#$main_root/}/pre-teardown.sh
+
+Two things are worth tailoring. Both are guesses only you can make.
+
+1. filesToLink -- in ${cfg_path#$main_root/}
+
+   A worktree is a fresh checkout, so anything git does not track is missing
+   from it: your .env, your local notes, your machine-specific settings.
+   Listing a path here symlinks it from the main repo into every worktree, so
+   one file stays shared instead of being copied and drifting.
+
+   People usually link: .env and friends, CLAUDE.local.md or similar local
+   instruction files, .claude/settings.local.json, editor-local settings.
+   A path that does not exist is skipped quietly, so listing extras is free.
+
+2. post-create.sh -- in ${hooks#$main_root/}
+
+   A fresh worktree has no dependencies installed. This script runs inside it
+   right after creation, so put whatever makes the checkout usable there:
+   npm/pnpm/bun/yarn install, a build step, generating a local config, a
+   monorepo's per-package installs. It is a normal shell script; edit it
+   freely. If it fails you get a warning, never a broken worktree.
+
+Then try it:  wt new my-first-worktree
+EOF
 }
 
 
@@ -1501,6 +1572,10 @@ HOOK
     || fail "init did not scaffold an executable post-create.sh (the docs promise it)"
   [[ -x "$initrepo/.opencode/hooks/pre-teardown.sh" ]] \
     || fail "init did not scaffold an executable pre-teardown.sh"
+  # init must explain the two things only the user can decide, or the scaffolds
+  # are just files with no story attached
+  grep -q "filesToLink" <<<"$out" || fail "init should explain filesToLink, got: $out"
+  grep -qi "dependencies installed" <<<"$out" || fail "init should explain what the hook is for, got: $out"
   [[ "$(jq -r '.hooks.postCreate' "$initrepo/.opencode/wt.json")" == ".opencode/hooks/post-create.sh" ]] \
     || fail "init's config must reference the hooks it scaffolded, or they are inert"
   out=$(cd "$initrepo" && WT_MAIN_ROOT="$initrepo" bash "$self" init 2>&1) \
@@ -1523,6 +1598,13 @@ HOOK
   rm -rf "$tmp/bin2"
   pass "install: skips the shim when wt already resolves to this script"
 
+  # --version must work and name the script actually running, because more than
+  # one wt on PATH is a real and confusing situation
+  out=$(w --version 2>&1) || fail "wt --version: $out"
+  grep -q "scionwood" <<<"$out" || fail "--version should name the tool, got: $out"
+  grep -q "$self" <<<"$out" || fail "--version should show which wt is running, got: $out"
+  pass "--version: reports the version and the running script"
+
   echo "wt test: $passes groups passed"
 }
 
@@ -1537,6 +1619,7 @@ case "${1:-}" in
   clean) shift; cmd_clean "$@" ;;
   teardown) shift; cmd_teardown "$@" ;;
   test) shift; cmd_test "$@" ;;
+  --version|-v|version) cmd_version ;;
   __merge) shift; config_merge ;;
   -h|--help|help|"") usage ;;
   *) die "unknown command: $1 (see --help)" ;;

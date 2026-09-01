@@ -69,49 +69,77 @@ Code, reimplemented natively for opencode.
 
 ## Install
 
-Once per machine:
+Three steps, once per machine.
+
+**1. Install it.**
 
 ```bash
 npm install -g scionwood
 ```
 
-That puts `wt` on your PATH. Then register the plugin in your **global** opencode
-config, `~/.config/opencode/opencode.json`, so it loads in every repository:
+**2. Tell opencode to load the plugin.** Add this to your global opencode config
+— `~/.config/opencode/opencode.json`, or `opencode.jsonc` if that is the one you
+have:
 
 ```json
 { "plugin": ["scionwood"] }
 ```
 
-Optionally write your cross-repo defaults:
+This is what gives each worktree its own code index and its own environment.
+The `wt` command works without it; the isolation does not.
+
+**3. Check it worked.**
 
 ```bash
-wt install     # creates ~/.config/wt/config.json
+wt --version
 ```
 
-`wt install` will not write a second `wt` onto your PATH if npm already put one
-there — it only writes the shim when you are installing from a repository copy
-rather than from npm.
+That's it. `wt new my-worktree` works right now, in any git repository, with no
+config at all.
+
+### What `wt new` does
+
+It creates the worktree, links your ignored files into it, runs your setup hook,
+indexes it — and then **launches opencode inside it**. On a Mac that is the same
+terminal tab you typed the command in. Pass `--no-open` if you just want the
+worktree.
+
+### Tailoring one repository
+
+Only when a repo needs its own settings:
+
+```bash
+wt init
+```
+
+That writes `.opencode/wt.json` and two hook scripts, then explains what is worth
+editing and why. Most repositories never need it.
 
 <details>
-<summary>Per-project install instead of global</summary>
+<summary>Installing into one project instead of globally</summary>
 
 ```bash
 npm install --save-dev scionwood
-npx wt install          # puts the global `wt` command in place
+npx wt install     # puts the global `wt` command in place
 ```
 
-and add `"plugin": ["scionwood"]` to the project's `opencode.json`.
+and add `"plugin": ["scionwood"]` to that project's `opencode.json`.
+
+`wt install` also writes `~/.config/wt/config.json`, where you can put defaults
+that apply to every repository. It will not put a second `wt` on your PATH if
+npm already put one there.
 </details>
 
-Per repository — only when a repo needs its own settings:
+<details>
+<summary>Requirements</summary>
 
-```bash
-wt init        # writes .opencode/wt.json and scaffolds .opencode/hooks/*.sh
-```
-
-Most repositories need neither. Built-in defaults plus your
-`~/.config/wt/config.json` are enough, and `wt new` works with no config at all.
-
+- [opencode](https://opencode.ai) — for the plugin half; the `wt` CLI works alone
+- git, and `jq` (`brew install jq`)
+- macOS for the terminal-launching behaviour; elsewhere `wt new` prints the `cd`
+  line instead
+- a code indexer such as [CodeGraph](https://github.com/) is optional — a tool
+  whose binary is missing is skipped with a warning
+</details>
 
 ## Quick start
 
@@ -151,6 +179,7 @@ Removes the codegraph data, symlinks, worktree, and branch — but only after ch
 | `wt teardown [name\|path] [--force]` | Remove worktree, branch, and codegraph data. Refuses if the worktree is dirty or the branch has unmerged commits; `--force` discards them. Bare `wt teardown` tears down the worktree you're standing in. |
 | `wt install [--config-home <dir>]` | Machine setup, once: the global `wt` command and `~/.config/wt/config.json`. Never writes into a repository. |
 | `wt test` | Run the built-in smoke tests (throwaway repo, no side effects). |
+| `wt --version` | Show the version and which `wt` you are running. |
 
 Name-based commands work from any directory, and bare commands work from anywhere inside a worktree, including its subdirectories. Paths are also accepted (e.g. `wt teardown .git-worktrees/review-pr-1234`).
 
@@ -265,15 +294,6 @@ Precedence: **env > repo file > global file > built-in default**.
 - **Ignored files**: paths in `filesToLink` are symlinked from the main repo into each worktree. Real files in the worktree are never overwritten; only previously created symlinks are replaced or removed.
 - **Permissions**: the plugin adds an `external_directory` allow rule for the main repo root, so reads through the symlinks work inside the worktree.
 - **Teardown safety**: only symlinks are deleted (never real files); branches are removed only when git allows it.
-
-## Requirements
-
-- [opencode](https://opencode.ai) ≥ 1.18
-- git
-- `jq` — required for `wt install` config writes. Install with `brew install jq`.
-- CodeGraph CLI (`codegraph` on PATH) — optional; a tool whose `detect` binary is missing is skipped with a warning
-- macOS for the terminal-launch magic (iTerm2 / Ghostty / Terminal). On other OSes commands print the `cd` line instead.
-- `bun` — only needed to run the plugin's unit tests, not for normal use.
 
 ## Testing
 
