@@ -121,6 +121,45 @@ export function findMainRepoRoot(from: string, basePath: string): string | undef
   }
 }
 
+/**
+ * Locate the bash CLI. The repository's own copy wins so a user's edited script
+ * is always the one that runs; otherwise fall back to whatever ships with this
+ * module -- which, for a global npm install, lives under opencode's plugin cache
+ * (~/.cache/opencode/node_modules/...) rather than anywhere inside the repo.
+ */
+export function resolveScriptPath(
+  directory: string,
+  moduleDir: string,
+  exists: (p: string) => boolean,
+): string | undefined {
+  const candidates = [
+    path.join(directory, SCRIPT_REL),
+    path.join(moduleDir, "scripts", "wt"),
+    path.join(moduleDir, "..", "scripts", "wt"),
+    path.join(directory, "node_modules", "sprig-worktree", "dist", "scripts", "wt"),
+  ]
+  return candidates.find(exists)
+}
+
+const MODULE_DIR: string =
+  typeof (import.meta as any).dir === "string"
+    ? (import.meta as any).dir
+    : path.dirname(new URL(import.meta.url).pathname)
+
+/**
+ * Decide whether the worktree's artifacts may be cleaned after a session closes.
+ * Fails closed: an unknown session list (an API error) never authorises deletion.
+ */
+export function shouldClean(
+  sessions: Array<{ id: string; directory?: string }> | undefined,
+  deletedId: string | undefined,
+  directory: string,
+): boolean {
+  if (!sessions) return false
+  const others = sessions.filter((s) => s.id !== deletedId && (s.directory ? s.directory === directory : true))
+  return others.length === 0
+}
+
 function makeLogger(client: any, service = "sprig-worktree"): Logger {
   return async (level, message, extra) => {
     try {
@@ -134,17 +173,13 @@ async function runScript(
   args: string[],
   extraEnv: Record<string, string> = {},
 ): Promise<{ code: number; output: string }> {
-  let script = path.join(directory, SCRIPT_REL)
-  if (!existsSync(script)) {
-    // npm-installed fallback: bundled bash lives at node_modules/sprig-worktree/dist/scripts/wt
-    const nodeModulesScript = path.join(directory, "node_modules", "sprig-worktree", "dist", "scripts", "wt")
-    if (existsSync(nodeModulesScript)) {
-      script = nodeModulesScript
-    } else {
-      return {
-        code: 1,
-        output: `wt script not found — looked at ${path.join(directory, SCRIPT_REL)} and ${nodeModulesScript}; install via 'npm install sprig-worktree' or copy .opencode/scripts/wt into your repo`,
-      }
+  const script = resolveScriptPath(directory, MODULE_DIR, existsSync)
+  if (!script) {
+    return {
+      code: 1,
+      output:
+        `wt script not found. Looked beside this plugin (${MODULE_DIR}) and in ${directory}. ` +
+        `Install with 'npm install sprig-worktree', or copy .opencode/scripts/wt into your repo.`,
     }
   }
   try {
@@ -267,16 +302,17 @@ export const SprigWorktreePlugin: Plugin = async ({ client, directory }) => {
     event: async ({ event }) => {
       if (event.type !== "session.deleted") return
       const deletedId = (event as any).properties?.info?.id
-      let remaining = true
+      let sessions: Array<{ id: string; directory?: string }> | undefined
       try {
         const res = await client.session.list()
-        remaining = (res.data ?? []).some(
-          (s: any) => s.id !== deletedId && (s.directory ? s.directory === directory : true),
-        )
-      } catch {
-        remaining = false
+        sessions = (res.data ?? []) as Array<{ id: string; directory?: string }>
+      } catch (e: any) {
+        await log("warn", "could not list sessions; skipping cleanup (failing closed)", {
+          error: String(e?.message ?? e),
+        })
+        return
       }
-      if (remaining) return
+      if (!shouldClean(sessions, deletedId, directory)) return
       const r = await runScript(directory, ["clean", info.root])
       await log(r.code === 0 ? "info" : "warn", "worktree artifacts cleaned", {
         ...(codegraphEnabled ? { dataDir: info.codegraphDataDir } : {}),

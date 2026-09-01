@@ -8,6 +8,8 @@ import {
   loadConfig,
   parseWorktree,
   findMainRepoRoot,
+  shouldClean,
+  resolveScriptPath,
   DEFAULT_CONFIG,
 } from "./sprig-worktree.ts"
 
@@ -299,5 +301,56 @@ describe("findMainRepoRoot", () => {
     mkdirSync(path.join(main, ".git-worktrees", "review-pr-1234"), { recursive: true })
     writeFileSync(path.join(main, ".git"), "gitdir: ../.git-worktrees/review-pr-1234/.git\n")
     expect(findMainRepoRoot(path.join(main, ".git-worktrees", "review-pr-1234"), ".git-worktrees")).toBeUndefined()
+  })
+})
+describe("shouldClean", () => {
+  const dir = "/repo/.git-worktrees/review-pr-1"
+
+  test("cleans when no other session remains for this directory", () => {
+    expect(shouldClean([{ id: "a", directory: dir }], "a", dir)).toBe(true)
+  })
+
+  test("does not clean while another session is open in this directory", () => {
+    expect(shouldClean([{ id: "a", directory: dir }, { id: "b", directory: dir }], "a", dir)).toBe(false)
+  })
+
+  test("ignores sessions belonging to other directories", () => {
+    expect(shouldClean([{ id: "a", directory: dir }, { id: "b", directory: "/elsewhere" }], "a", dir)).toBe(true)
+  })
+
+  test("fails closed when the session list is unavailable", () => {
+    expect(shouldClean(undefined, "a", dir)).toBe(false)
+  })
+})
+
+describe("resolveScriptPath", () => {
+  const repo = "/repo"
+  const cacheDist = "/home/u/.cache/opencode/node_modules/sprig-worktree/dist"
+  const only = (...present: string[]) => (p: string) => present.includes(p)
+
+  test("prefers the repository's own copy", () => {
+    const repoCopy = path.join(repo, ".opencode", "scripts", "wt")
+    const bundled = path.join(cacheDist, "scripts", "wt")
+    expect(resolveScriptPath(repo, cacheDist, only(repoCopy, bundled))).toBe(repoCopy)
+  })
+
+  test("finds the bundled script beside the plugin module in opencode's cache", () => {
+    const bundled = path.join(cacheDist, "scripts", "wt")
+    expect(resolveScriptPath(repo, cacheDist, only(bundled))).toBe(bundled)
+  })
+
+  test("finds the source script when running from a checkout", () => {
+    const srcDir = "/checkout/.opencode/plugins"
+    const source = path.join("/checkout", ".opencode", "scripts", "wt")
+    expect(resolveScriptPath(repo, srcDir, only(source))).toBe(source)
+  })
+
+  test("falls back to the repository's node_modules", () => {
+    const legacy = path.join(repo, "node_modules", "sprig-worktree", "dist", "scripts", "wt")
+    expect(resolveScriptPath(repo, cacheDist, only(legacy))).toBe(legacy)
+  })
+
+  test("returns undefined when nothing is present", () => {
+    expect(resolveScriptPath(repo, cacheDist, () => false)).toBeUndefined()
   })
 })
