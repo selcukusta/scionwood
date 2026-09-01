@@ -730,7 +730,7 @@ clean_artifacts() {
 
 resolve_worktree_target() {
   local target="${1:-}"
-  local main_root wt base registered m found
+  local main_root wt base registered m
   main_root="$(main_root_from "$(pwd -P)")" || die "could not locate the main repository"
   load_config "$main_root"
   main_root="$(cd "$main_root" && pwd -P)"
@@ -747,25 +747,33 @@ resolve_worktree_target() {
   fi
   wt="$(cd "$wt" && pwd -P)"
 
+  # Attribute the path to the worktree that contains it, so bare commands work
+  # from any subdirectory. Longest match wins, otherwise everything inside the
+  # repository would be attributed to the main worktree. The main repository
+  # itself only matches exactly -- a stray directory under basePath must report
+  # "not a registered worktree", not "refusing to act on the main repository".
+  local best="" m_phys
+  registered="$(git -C "$main_root" worktree list --porcelain 2>/dev/null \
+    | awk '/^worktree /{sub(/^worktree /,""); print}')"
+  while IFS= read -r m; do
+    [[ -n "$m" ]] || continue
+    m_phys="$(cd "$m" 2>/dev/null && pwd -P)" || continue
+    if [[ "$m_phys" == "$main_root" ]]; then
+      [[ "$wt" == "$m_phys" ]] || continue
+    elif [[ "$wt" != "$m_phys" && "$wt" != "$m_phys"/* ]]; then
+      continue
+    fi
+    [[ ${#m_phys} -gt ${#best} ]] && best="$m_phys"
+  done <<< "$registered"
+  [[ -n "$best" ]] || die "not a registered worktree of $main_root: $wt (see 'wt list')"
+  wt="$best"
+
   [[ "$wt" != "$main_root" ]] || die "refusing to act on the main repository: $wt"
 
   base="${CFG_BASE_PATH#./}"
   base="${base%/}"
   [[ "$wt" == "$main_root/$base/"* ]] \
     || die "not a worktree of this repository (expected under $main_root/$base): $wt (see 'wt list')"
-
-  # must be a worktree git actually knows about, in THIS repository
-  registered="$(git -C "$main_root" worktree list --porcelain 2>/dev/null \
-    | awk '/^worktree /{sub(/^worktree /,""); print}')"
-  found=1
-  while IFS= read -r m; do
-    [[ -n "$m" ]] || continue
-    if [[ "$m" == "$wt" ]] || [[ "$(cd "$m" 2>/dev/null && pwd -P)" == "$wt" ]]; then
-      found=0
-      break
-    fi
-  done <<< "$registered"
-  [[ $found -eq 0 ]] || die "not a registered worktree of $main_root: $wt (see 'wt list')"
 
   echo "$wt"
 }
@@ -1126,6 +1134,27 @@ IGNORE
   out=$(w teardown review-pr-7890 --force 2>&1) || fail "teardown --force with unmerged commits: $out"
   [[ ! -d "$repo/.git-worktrees/review-pr-7890" ]] || fail "--force did not remove the worktree"
   pass "teardown: refuses dirty worktrees and unmerged branches without --force"
+
+  # defect C — cwd must be captured before the worktree is removed
+  out=$(w install --reset --defaults --non-interactive 2>&1) || fail "reset config for cwd tests: $out"
+
+  out=$(w new review-pr-8901 2>&1) || fail "new review-pr-8901: $out"
+  out=$(cd "$repo/.git-worktrees/review-pr-8901" && bash "$self" teardown 2>&1) \
+    || fail "teardown from inside the worktree: $out"
+  grep -q "you were inside the removed worktree" <<<"$out" \
+    || fail "expected the cwd recovery notice, got: $out"
+  grep -q "cd \"$repo\"" <<<"$out" || fail "recovery notice should name the repo root, got: $out"
+  if grep -q "getcwd" <<<"$out"; then
+    fail "teardown read the working directory after deleting it: $out"
+  fi
+
+  out=$(w new review-pr-9012 2>&1) || fail "new review-pr-9012: $out"
+  mkdir -p "$repo/.git-worktrees/review-pr-9012/nested/deep"
+  out=$(cd "$repo/.git-worktrees/review-pr-9012/nested/deep" && bash "$self" teardown 2>&1) \
+    || fail "teardown from a nested directory inside the worktree: $out"
+  grep -q "you were inside the removed worktree" <<<"$out" \
+    || fail "recovery notice should fire from a nested directory too, got: $out"
+  pass "teardown: cwd recovery notice fires from the worktree and its subdirectories"
 
   echo "wt test: $passes groups passed"
 }
