@@ -131,6 +131,18 @@ main_root_from() { # $1 start dir, $2 optional basePath marker (default: CFG_BAS
 # file (preferred -- the user edits a real script) or an inline shell command.
 # A missing or non-executable file warns and continues: a hook is a convenience,
 # never a gate on having a usable worktree.
+# A failed hook is not fatal, but the consequence is invisible unless we say it:
+# the worktree exists and looks finished, while whatever the hook was meant to
+# set up is simply missing.
+hook_failed_note() { # $1 phase, $2 spec, $3 worktree
+  echo "wt: warning: hook $1 failed ($2)" >&2
+  if [[ "$1" == "postCreate" ]]; then
+    echo "wt: warning: the worktree was still created, but its setup did not finish," >&2
+    echo "wt: warning: so dependencies are probably missing. Fix the hook, then run:" >&2
+    echo "wt: warning:   wt bootstrap $(basename "$3")" >&2
+  fi
+}
+
 run_hook() { # $1 phase (postCreate|preTeardown), $2 worktree
   local phase="$1" wt="$2" spec main_root name branch candidate
   spec="$(cfg ".hooks.$phase")"
@@ -151,7 +163,7 @@ run_hook() { # $1 phase (postCreate|preTeardown), $2 worktree
     echo "  hook  $phase ($spec)"
     if ! (cd "$wt" && WT_NAME="$name" WT_ROOT="$wt" WT_MAIN_ROOT="$main_root" WT_BRANCH="$branch" \
           "$candidate"); then
-      echo "wt: warning: hook $phase failed" >&2
+      hook_failed_note "$phase" "$spec" "$wt" "$wt"
     fi
     return 0
   fi
@@ -170,7 +182,7 @@ run_hook() { # $1 phase (postCreate|preTeardown), $2 worktree
   echo "  hook  $phase (inline)"
   if ! (cd "$wt" && WT_NAME="$name" WT_ROOT="$wt" WT_MAIN_ROOT="$main_root" WT_BRANCH="$branch" \
         bash -c "$spec"); then
-    echo "wt: warning: hook $phase failed" >&2
+    hook_failed_note "$phase" "$spec"
   fi
   return 0
 }
@@ -1725,6 +1737,24 @@ HOOK
   out=$(cd "$outside" && bash "$self" --version 2>&1) || fail "wt --version must work outside a repository: $out"
   grep -qE "scionwood [0-9]" <<<"$out" || fail "--version outside a repo, got: $out"
   pass "outside a repository: plain error with the fix, except --version"
+
+  # a failing postCreate must say what it MEANS, not just that it failed: the
+  # worktree looks finished while its setup silently did not happen
+  jq -n '{tools:{"!codegraph":true}, hooks:{postCreate:"definitely-not-a-real-command"}}' > "$cfg"
+  out=$(w new review-pr-4680 --pr 4680 2>&1) || fail "a failing hook must not fail worktree creation: $out"
+  [[ -d "$repo/.git-worktrees/review-pr-4680" ]] || fail "worktree missing after a failing hook"
+  grep -q "hook postCreate failed" <<<"$out" || fail "should report the hook failed, got: $out"
+  grep -qi "setup did not finish" <<<"$out" || fail "should explain the consequence, got: $out"
+  grep -q "wt bootstrap review-pr-4680" <<<"$out" \
+    || fail "should name the exact recovery command with the worktree name, got: $out"
+
+  # and the recovery command must actually work once the hook is fixed
+  jq -n '{tools:{"!codegraph":true}, hooks:{postCreate:"touch .setup-ran"}}' > "$cfg"
+  out=$(w bootstrap review-pr-4680 2>&1) || fail "wt bootstrap after fixing the hook: $out"
+  [[ -f "$repo/.git-worktrees/review-pr-4680/.setup-ran" ]] || fail "bootstrap did not re-run the fixed hook"
+  out=$(w teardown review-pr-4680 --force 2>&1) || fail "teardown after hook-failure test: $out"
+  rm -f "$cfg"
+  pass "hook failure: explains the consequence and the recovery, which works"
 
   echo "wt test: $passes groups passed"
 }
