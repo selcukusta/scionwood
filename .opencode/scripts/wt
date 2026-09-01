@@ -412,9 +412,15 @@ APPLESCRIPT
   echo "open it:  cd \"$wt\" && opencode"
 }
 
-# basePath is our directory, inside the user's repo. Left alone it shows up as
-# untracked noise in every git status, and any tool that scans the repo root --
-# an indexer, a linter -- walks into it and processes every worktree twice.
+# basePath is our directory, inside the user's repo, so without this it shows up
+# as untracked noise in every git status -- a papercut we create.
+#
+# It is only that. An earlier version of this comment claimed repo-root scanners
+# would walk into the worktrees and index everything twice; that was asserted,
+# not measured, and it is wrong for codegraph at least: it skips nested
+# worktrees while indexing ordinary subdirectories at the same depth. Tools that
+# do not skip them would still benefit, but do not claim it as the reason.
+#
 # .git/info/exclude is the polite place for this: local to the clone, never
 # committed, so it does not appear in anyone else's checkout.
 ensure_local_ignore() { # $1 main_root, $2 basePath
