@@ -12,35 +12,32 @@ _CFG_LOADED=false
 usage() {
   cat <<'EOF'
 usage:
-  wt new <name>                create <basePath>/<name>, bootstrap it, open opencode
-                              <name> must match the configured name pattern (default
-                              'review-pr-1234'); the PR head is fetched from origin
-  wt list                     list review worktrees and their branches
+  wt new <name> [--pr N | --branch <ref> | --from <ref>] [--no-open]
+                              create <basePath>/<name> and bootstrap it
+                              no source flag: branch from the repo default branch
+                              --pr N      fetch a pull/merge request (see prRef)
+                              --branch R  track an existing remote branch
+                              --from R    branch from a tag, sha or branch
+                              --no-open   print the cd line instead of launching
+                              with --pr and no name, the worktree is named pr-N
+  wt list                     list worktrees and their branches
   wt config [--layers]        print the effective config; --layers also shows
                               which file each layer came from
-  wt init [--force]           write <repo>/.opencode/wt.json
-  wt open <name>              open opencode in an existing review worktree
-  wt bootstrap [name|path]    (re)create ignored-file symlinks + npm install
-                              (configured dirs) + codegraph index
-  wt clean [name|path]        remove worktree artifacts only (symlinks + tool data),
-                              keep the worktree and branch
+  wt open <name>              open opencode in an existing worktree
+  wt bootstrap [name|path]    (re)create symlinks, run hooks and tool setup
+  wt clean [name|path]        remove worktree artifacts only (symlinks + tool
+                              data dirs), keep the worktree and branch
   wt teardown [name|path] [--force]
-                              remove worktree + branch + codegraph data
+                              remove worktree + branch + tool data
                               refuses if the worktree is dirty or the branch has
                               unmerged commits; --force discards them
-                              name = folder under <basePath> (works from anywhere);
-                              path = direct path; default: cwd
-  wt install [--reset] [--non-interactive] [--defaults] [--config <path>]
-                              write .opencode/wt.json at the repo root (interactive
-                              by default), then install a global 'wt' command bound to
-                              this repository
-                              --reset            wipe config and re-prompt with defaults
-                              --non-interactive  fail if config missing or --reset given
-                              --defaults         only with --non-interactive; write the
-                                                 default config without prompting
-                              --config <path>    override config file location (default:
-                                                 .opencode/wt.json at the main repo root)
-  wt test                     run the built-in smoke tests (throwaway repo, no side effects)
+                              name = folder under <basePath> (works from anywhere)
+                              path = direct path; default: the worktree you are in
+  wt install [--config-home <dir>]
+                              machine setup, run once: writes the global wt
+                              command and ~/.config/wt/config.json
+  wt init [--force]           repository setup: writes <repo>/.opencode/wt.json
+  wt test                     run the built-in smoke tests (throwaway repo)
 
 env:
   WT_OPEN=auto|exec|tab|none  how to launch opencode after "new"/"open" (default: auto)
@@ -49,20 +46,17 @@ env:
                               exec: always same tab   tab: force new tab   none: print only
   WT_MAIN_ROOT=/path          act on this repository instead of the one containing
                               the current directory (autodetection is the default)
+  WT_CONFIG_HOME=/path        override the config directory (default: ~/.config)
   WT_BIN=/path                install target directory (default: /opt/homebrew/bin,
                               /usr/local/bin or ~/.local/bin)
 
-config overrides (env vars beat .opencode/wt.json, which beats built-in defaults):
+config overrides (env beats <repo>/.opencode/wt.json, which beats
+~/.config/wt/config.json, which beats built-in defaults):
   WT_BASE=path                worktree base path (default: .git-worktrees)
-  WT_BRANCH_PREFIX=prefix     branch prefix for new worktrees (default: review/)
-  WT_NAME_PATTERN=regex       PR-name pattern, exactly one capture group
-                              (default: ^review-pr-([0-9]+)$)
-  WT_FETCH_PRUNE=y|n|1|0      run 'git fetch --prune' on new (default: y)
-  WT_PULL_REBASE=y|n|1|0      run 'git pull --rebase' on new (default: y)
+  WT_BRANCH_PREFIX=prefix     branch prefix for new worktrees (default: wt/)
+  WT_PR_REF=template          pull/merge-request ref (default: pull/{n}/head)
+                              GitLab: merge-requests/{n}/head
   WT_FILES_TO_LINK=a,b        comma-separated files/dirs to symlink into worktrees
-                              (default: CLAUDE.local.md,.claude/settings.local.json,.env)
-  WT_NPM_DIRS=a,b             comma-separated dirs to npm install (default: .,apps/frontend)
-  WT_CODEGRAPH=y|n|1|0        run codegraph indexing on bootstrap (default: y)
 EOF
   exit 1
 }
@@ -283,54 +277,92 @@ APPLESCRIPT
   echo "open it:  cd \"$wt\" && opencode"
 }
 
-cmd_new() {
-  local name
-  [[ $# -ge 1 ]] || usage
-  name="$1"
+default_base_ref() { # $1 main_root; prints the repository's default branch ref
+  local main_root="$1" ref
+  ref="$(git -C "$main_root" symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null || true)"
+  if [[ -n "$ref" ]]; then
+    echo "${ref#refs/remotes/}"
+    return 0
+  fi
+  git -C "$main_root" rev-parse --abbrev-ref HEAD
+}
 
+cmd_new() {
+  local name="" src_kind="" src_val="" no_open=false arg
+  while [[ $# -gt 0 ]]; do
+    arg="$1"
+    case "$arg" in
+      --pr|--branch|--from)
+        [[ $# -ge 2 ]] || die "option $arg requires a value"
+        [[ -z "$src_kind" ]] || die "only one source may be given, got --$src_kind and $arg"
+        src_kind="${arg#--}"; src_val="$2"; shift 2 ;;
+      --pr=*|--branch=*|--from=*)
+        [[ -z "$src_kind" ]] || die "only one source may be given, got --$src_kind and ${arg%%=*}"
+        src_kind="${arg%%=*}"; src_kind="${src_kind#--}"; src_val="${arg#*=}"; shift ;;
+      --no-open) no_open=true; shift ;;
+      -*) die "unknown option for new: $arg (see --help)" ;;
+      *)
+        [[ -z "$name" ]] || die "new takes at most one name, got '$name' and '$arg'"
+        name="$arg"; shift ;;
+    esac
+  done
+
+  if [[ -z "$name" ]]; then
+    [[ "$src_kind" == "pr" ]] || die "a worktree name is required (or use --pr <n>)"
+    name="pr-$src_val"
+  fi
   [[ "$name" != */* ]] || die "worktree name must be a plain folder name, got: $name"
 
   local main_root
-  main_root="$(main_root_from "$(pwd -P)")" || die "could not locate the main repository (run from inside the repo, or set WT_MAIN_ROOT)"
+  main_root="$(main_root_from "$(pwd -P)")" \
+    || die "could not locate the main repository (run from inside the repo, or set WT_MAIN_ROOT)"
   load_config "$main_root"
 
-  local name_pattern
-  name_pattern="$(cfg '.namePattern')"
-  if [[ ! "$name" =~ $name_pattern ]]; then
-    die "worktree name must match '$name_pattern', got: $name"
-  fi
-  local pr_number="${BASH_REMATCH[1]}"
-  local local_branch="$(cfg '.branchPrefix')${name}"
+  local branch base_path wt
+  branch="$(cfg '.branchPrefix')$name"
+  base_path="$(cfg '.basePath')"
+  wt="$main_root/$base_path/$name"
+  [[ -e "$wt" ]] && die "worktree already exists: $wt"
+  mkdir -p "$main_root/$base_path"
 
-  local wt
-  wt="$main_root/$CFG_BASE_PATH/$name"
-  if [[ -e "$wt" ]]; then
-    die "worktree already exists: $wt"
-  fi
-  mkdir -p "$main_root/$CFG_BASE_PATH"
+  # Always fetch: it is read-only and cheap. Never pull/rebase -- mutating the
+  # branch the user has checked out is a side effect creating a worktree should
+  # not have.
+  git -C "$main_root" fetch --prune origin >/dev/null 2>&1 || true
 
-  if [[ "$(cfg '.fetchPrune')" == "true" ]]; then
-    git -C "$main_root" fetch --prune
-  else
-    echo "  skipping fetch --prune (per config)"
-  fi
-
-  if [[ "$(cfg '.pullRebase')" == "true" ]]; then
-    if ! git -C "$main_root" pull --rebase; then
-      echo "wt: warning: 'git pull --rebase' failed (no upstream?); continuing" >&2
-    fi
-  else
-    echo "  skipping pull --rebase (per config)"
-  fi
-
-  if ! git -C "$main_root" fetch origin "pull/$pr_number/head:$local_branch"; then
-    die "could not fetch PR #$pr_number from origin (does it exist on GitHub?)"
-  fi
-
-  git -C "$main_root" worktree add "$wt" "$local_branch"
+  case "$src_kind" in
+    pr)
+      [[ "$src_val" =~ ^[0-9]+$ ]] || die "--pr expects a number, got: $src_val"
+      local ref
+      ref="$(cfg '.prRef')"
+      ref="${ref//\{n\}/$src_val}"
+      git -C "$main_root" fetch origin "$ref:$branch" \
+        || die "could not fetch $ref from origin (does #$src_val exist? for GitLab set prRef to merge-requests/{n}/head)"
+      git -C "$main_root" worktree add "$wt" "$branch"
+      ;;
+    branch)
+      git -C "$main_root" fetch origin "$src_val" \
+        || die "could not fetch branch '$src_val' from origin"
+      git -C "$main_root" worktree add -b "$branch" "$wt" FETCH_HEAD
+      ;;
+    from)
+      git -C "$main_root" rev-parse --verify --quiet "$src_val^{commit}" >/dev/null \
+        || die "not a known commit, branch or tag: $src_val"
+      git -C "$main_root" worktree add -b "$branch" "$wt" "$src_val"
+      ;;
+    *)
+      local base
+      base="$(default_base_ref "$main_root")"
+      git -C "$main_root" worktree add -b "$branch" "$wt" "$base"
+      ;;
+  esac
 
   bootstrap_dir "$wt"
-  open_in_terminal "$wt"
+  if $no_open; then
+    echo "open it:  cd \"$wt\" && opencode"
+  else
+    open_in_terminal "$wt"
+  fi
 }
 
 cmd_bootstrap() {
@@ -422,10 +454,8 @@ config_defaults_json() {
   cat <<'JSON'
 {
   "basePath": ".git-worktrees",
-  "branchPrefix": "review/",
-  "namePattern": "^review-pr-([0-9]+)$",
-  "fetchPrune": true,
-  "pullRebase": true,
+  "branchPrefix": "wt/",
+  "prRef": "pull/{n}/head",
   "filesToLink": ["CLAUDE.local.md", ".claude/settings.local.json", ".env"],
   "hooks": {},
   "tools": {
@@ -863,13 +893,13 @@ IGNORE
   w() { (cd "$tmp/repo" && bash "$self" "$@"); }
 
   local out
-  out=$(w new review-pr-1234 2>&1) || fail "new review-pr-1234: $out"
+  out=$(w new review-pr-1234 --pr 1234 2>&1) || fail "new review-pr-1234 --pr 1234: $out"
   [[ -d "$repo/$CFG_BASE_PATH/review-pr-1234" ]] || fail "worktree dir missing"
-  [[ "$(git -C "$repo/$CFG_BASE_PATH/review-pr-1234" branch --show-current)" == "review/review-pr-1234" ]] || fail "expected branch review/review-pr-1234"
+  [[ "$(git -C "$repo/$CFG_BASE_PATH/review-pr-1234" branch --show-current)" == "wt/review-pr-1234" ]] || fail "expected branch wt/review-pr-1234"
   [[ -L "$repo/$CFG_BASE_PATH/review-pr-1234/.env" ]] || fail ".env not symlinked"
   [[ "$(readlink "$repo/$CFG_BASE_PATH/review-pr-1234/.env")" == "$repo/.env" ]] || fail ".env symlink target wrong"
   [[ -d "$repo/$CFG_BASE_PATH/review-pr-1234/.codegraph-review-pr-1234" ]] || fail "codegraph data dir missing (env contract broken)"
-  pass "new: PR worktree, branch review/review-pr-1234, symlinks, codegraph env contract"
+  pass "new: --pr worktree, branch wt/review-pr-1234, symlinks, codegraph env contract"
 
   out=$(w list 2>&1) || fail "list: $out"
   grep -q "review-pr-1234" <<<"$out" || fail "list output missing review-pr-1234"
@@ -884,18 +914,21 @@ IGNORE
   [[ -L "$repo/$CFG_BASE_PATH/review-pr-1234/.env" ]] || fail "bootstrap did not restore symlink"
   pass "bootstrap: idempotent"
 
-  out=$(w new bad-name 2>&1) && fail "new bad-name should have failed"
-  grep -q "review-pr-" <<<"$out" || fail "error message should mention expected PR name format"
-  pass "new: rejects name without PR number"
+  out=$(w new nested/name 2>&1) && fail "new should reject a name containing a slash"
+  grep -qi "plain folder name" <<<"$out" || fail "error should explain the name must be a plain folder name, got: $out"
+  out=$(w new a b 2>&1) && fail "new should reject two names"
+  grep -qi "at most one name" <<<"$out" || fail "error should say at most one name, got: $out"
+  pass "new: rejects a path-like name and a second name"
 
-  out=$(w new review-pr-99999 2>&1) && fail "new review-pr-99999 should have failed (PR does not exist)"
-  grep -q "PR #99999" <<<"$out" || fail "error message should mention PR number"
-  pass "new: rejects non-existent PR"
+  out=$(w new review-pr-99999 --pr 99999 2>&1) && fail "new review-pr-99999 should have failed (PR does not exist)"
+  grep -q "99999" <<<"$out" || fail "error message should mention the PR number, got: $out"
+  grep -qi "merge-requests" <<<"$out" || fail "error should hint at prRef for other forges, got: $out"
+  pass "new: rejects a non-existent PR and hints at prRef"
 
   out=$(cd "$tmp" && WT_MAIN_ROOT="$tmp/repo" bash "$self" teardown review-pr-1234 2>&1) || fail "teardown by name from outside: $out"
   [[ ! -d "$repo/$CFG_BASE_PATH/review-pr-1234" ]] || fail "worktree not removed"
-  if git -C "$tmp/repo" branch --list "review/review-pr-1234" | grep -q .; then
-    fail "branch review/review-pr-1234 not deleted"
+  if git -C "$tmp/repo" branch --list "wt/review-pr-1234" | grep -q .; then
+    fail "branch wt/review-pr-1234 not deleted"
   fi
   pass "teardown: by name with WT_MAIN_ROOT (installed-wrapper contract)"
 
@@ -936,14 +969,14 @@ IGNORE
   pass "config: invalid JSON is fatal, not a silent fallback"
 
   jq -n '{basePath: ".wt-trees"}' > "$cfg"
-  out=$(w new review-pr-1234 2>&1) || fail "new (config basePath .wt-trees): $out"
+  out=$(w new review-pr-1234 --pr 1234 2>&1) || fail "new (config basePath .wt-trees): $out"
   [[ -d "$repo/.wt-trees/review-pr-1234" ]] || fail "worktree not at configured basePath .wt-trees"
-  [[ "$(git -C "$repo/.wt-trees/review-pr-1234" branch --show-current)" == "review/review-pr-1234" ]] || fail "branch wrong with configured basePath"
+  [[ "$(git -C "$repo/.wt-trees/review-pr-1234" branch --show-current)" == "wt/review-pr-1234" ]] || fail "branch wrong with configured basePath"
   pass "config: custom basePath creates worktree there"
 
   jq -n '{tools: {"!codegraph": true}}' > "$cfg"
   rm -f "$tmp/codegraph_called"
-  out=$(w new review-pr-2345 2>&1) || fail "new (codegraph removed): $out"
+  out=$(w new review-pr-2345 --pr 2345 2>&1) || fail "new (codegraph removed): $out"
   [[ -d "$repo/.git-worktrees/review-pr-2345" ]] || fail "worktree not created with codegraph removed"
   [[ ! -e "$repo/.git-worktrees/review-pr-2345/.codegraph-review-pr-2345" ]] || fail "codegraph data dir created despite removal"
   [[ ! -f "$tmp/codegraph_called" ]] || fail "codegraph binary invoked despite removal"
@@ -956,7 +989,7 @@ IGNORE
   pass "config: WT_BASE env var overrides config basePath"
 
   jq -n '{branchPrefix: "pr/"}' > "$cfg"
-  out=$(w new review-pr-3456 2>&1) || fail "new with a custom branchPrefix: $out"
+  out=$(w new review-pr-3456 --pr 3456 2>&1) || fail "new with a custom branchPrefix: $out"
   [[ -d "$repo/.git-worktrees/review-pr-3456" ]] || fail "worktree not created for review-pr-3456"
   [[ "$(git -C "$repo/.git-worktrees/review-pr-3456" branch --show-current)" == "pr/review-pr-3456" ]] \
     || fail "expected branch pr/review-pr-3456"
@@ -965,7 +998,7 @@ IGNORE
   # defect A — bare invocations must not crash under `set -u`
   rm -f "$cfg"   # reset to built-in defaults
 
-  out=$(w new review-pr-5678 2>&1) || fail "new review-pr-5678: $out"
+  out=$(w new review-pr-5678 --pr 5678 2>&1) || fail "new review-pr-5678: $out"
   out=$(cd "$repo/.git-worktrees/review-pr-5678" && bash "$self" bootstrap 2>&1) \
     || fail "bare bootstrap from inside the worktree: $out"
   [[ -L "$repo/.git-worktrees/review-pr-5678/.env" ]] || fail "bare bootstrap did not link .env"
@@ -987,7 +1020,7 @@ IGNORE
   if grep -q "WT_MAIN_ROOT=" "$tmp/bin/wt"; then
     fail "shim pins WT_MAIN_ROOT; it must resolve the repository from the current directory"
   fi
-  out=$(cd "$tmp/repo2" && "$tmp/bin/wt" new review-pr-1234 2>&1) || fail "shim new inside repo2: $out"
+  out=$(cd "$tmp/repo2" && "$tmp/bin/wt" new review-pr-1234 --pr 1234 2>&1) || fail "shim new inside repo2: $out"
   [[ -d "$repo2/.git-worktrees/review-pr-1234" ]] || fail "shim did not create the worktree in repo2"
   [[ ! -d "$repo/.git-worktrees/review-pr-1234" ]] || fail "shim leaked a worktree into the install-time repository"
   pass "install: shim resolves the repository from cwd, not from install time"
@@ -1013,7 +1046,7 @@ IGNORE
   # defect E — teardown must not silently discard work
   rm -f "$cfg"
 
-  out=$(w new review-pr-6789 2>&1) || fail "new review-pr-6789: $out"
+  out=$(w new review-pr-6789 --pr 6789 2>&1) || fail "new review-pr-6789: $out"
   echo "uncommitted" >> "$repo/.git-worktrees/review-pr-6789/file.txt"
   out=$(w teardown review-pr-6789 2>&1) && fail "teardown removed a dirty worktree without --force"
   grep -q "uncommitted" <<<"$out" || fail "refusal should name the uncommitted changes, got: $out"
@@ -1021,7 +1054,7 @@ IGNORE
   out=$(w teardown review-pr-6789 --force 2>&1) || fail "teardown --force on a dirty worktree: $out"
   [[ ! -d "$repo/.git-worktrees/review-pr-6789" ]] || fail "--force did not remove the worktree"
 
-  out=$(w new review-pr-7890 2>&1) || fail "new review-pr-7890: $out"
+  out=$(w new review-pr-7890 --pr 7890 2>&1) || fail "new review-pr-7890: $out"
   echo "extra" >> "$repo/.git-worktrees/review-pr-7890/file.txt"
   git -C "$repo/.git-worktrees/review-pr-7890" add file.txt
   git -C "$repo/.git-worktrees/review-pr-7890" -c user.email=t@t -c user.name=t commit -qm "unmerged work"
@@ -1035,7 +1068,7 @@ IGNORE
   # defect C — cwd must be captured before the worktree is removed
   rm -f "$cfg"
 
-  out=$(w new review-pr-8901 2>&1) || fail "new review-pr-8901: $out"
+  out=$(w new review-pr-8901 --pr 8901 2>&1) || fail "new review-pr-8901: $out"
   out=$(cd "$repo/.git-worktrees/review-pr-8901" && bash "$self" teardown 2>&1) \
     || fail "teardown from inside the worktree: $out"
   grep -q "you were inside the removed worktree" <<<"$out" \
@@ -1045,7 +1078,7 @@ IGNORE
     fail "teardown read the working directory after deleting it: $out"
   fi
 
-  out=$(w new review-pr-9012 2>&1) || fail "new review-pr-9012: $out"
+  out=$(w new review-pr-9012 --pr 9012 2>&1) || fail "new review-pr-9012: $out"
   mkdir -p "$repo/.git-worktrees/review-pr-9012/nested/deep"
   out=$(cd "$repo/.git-worktrees/review-pr-9012/nested/deep" && bash "$self" teardown 2>&1) \
     || fail "teardown from a nested directory inside the worktree: $out"
@@ -1138,7 +1171,7 @@ STUB
             env: {FAKE_ROOT: "{worktree}", FAKE_DATA: "{dataDir}"},
             setup: "faketool"
           }}}' > "$cfg"
-  out=$(w new review-pr-5678 2>&1) || fail "new with a custom tool: $out"
+  out=$(w new review-pr-5678 --pr 5678 2>&1) || fail "new with a custom tool: $out"
   local fwt="$repo/.git-worktrees/review-pr-5678"
   [[ -d "$fwt/.fake-review-pr-5678" ]] || fail "tool dataDir not created: $out"
   [[ "$(cat "$fwt/.fake-review-pr-5678/root")" == "$fwt" ]] \
@@ -1150,14 +1183,14 @@ STUB
 
   # detect gating: an absent binary skips the tool but still creates the worktree
   jq -n '{tools: {"!codegraph": true, ghosttool: {detect: "definitely-not-installed", setup: "definitely-not-installed"}}}' > "$cfg"
-  out=$(w new review-pr-6789 2>&1) || fail "new must succeed when a tool binary is absent: $out"
+  out=$(w new review-pr-6789 --pr 6789 2>&1) || fail "new must succeed when a tool binary is absent: $out"
   [[ -d "$repo/.git-worktrees/review-pr-6789" ]] || fail "worktree not created with an absent tool"
   grep -qi "skip" <<<"$out" || fail "absent tool should be reported as skipped, got: $out"
   out=$(w teardown review-pr-6789 --force 2>&1) || fail "teardown after detect test: $out"
 
   # a dataDir escaping the worktree must never be deleted
   jq -n '{tools: {"!codegraph": true, escapee: {dataDir: "../../escape-{name}"}}}' > "$cfg"
-  out=$(w new review-pr-7890 2>&1) || fail "new with an escaping dataDir: $out"
+  out=$(w new review-pr-7890 --pr 7890 2>&1) || fail "new with an escaping dataDir: $out"
   mkdir -p "$repo/../escape-review-pr-7890" 2>/dev/null || true
   out=$(w clean review-pr-7890 2>&1) || fail "clean with an escaping dataDir: $out"
   [[ -d "$repo/../escape-review-pr-7890" ]] || fail "clean deleted a dataDir outside the worktree"
@@ -1177,23 +1210,23 @@ HOOK
   chmod +x "$repo/.opencode/hooks/post-create.sh"
   jq -n '{tools:{"!codegraph":true}, hooks:{postCreate:".opencode/hooks/post-create.sh"}}' > "$cfg"
 
-  out=$(w new review-pr-8901 2>&1) || fail "new with a file hook: $out"
+  out=$(w new review-pr-8901 --pr 8901 2>&1) || fail "new with a file hook: $out"
   local hwt="$repo/.git-worktrees/review-pr-8901"
   [[ -f "$hwt/.hook-ran" ]] || fail "postCreate hook did not run: $out"
   [[ "$(sed -n 1p "$hwt/.hook-ran")" == "review-pr-8901" ]] || fail "hook WT_NAME wrong"
   [[ "$(sed -n 2p "$hwt/.hook-ran")" == "$hwt" ]] || fail "hook WT_ROOT wrong"
   [[ "$(sed -n 3p "$hwt/.hook-ran")" == "$repo" ]] || fail "hook WT_MAIN_ROOT wrong"
-  [[ "$(sed -n 4p "$hwt/.hook-ran")" == "review/review-pr-8901" ]] || fail "hook WT_BRANCH wrong"
+  [[ "$(sed -n 4p "$hwt/.hook-ran")" == "wt/review-pr-8901" ]] || fail "hook WT_BRANCH wrong"
   [[ "$(sed -n 5p "$hwt/.hook-ran")" == "$hwt" ]] || fail "hook cwd must be the worktree"
   out=$(w teardown review-pr-8901 --force 2>&1) || fail "teardown after file-hook test: $out"
 
   jq -n '{tools:{"!codegraph":true}, hooks:{postCreate:"echo inline > .hook-inline"}}' > "$cfg"
-  out=$(w new review-pr-9012 2>&1) || fail "new with an inline hook: $out"
+  out=$(w new review-pr-9012 --pr 9012 2>&1) || fail "new with an inline hook: $out"
   [[ "$(cat "$repo/.git-worktrees/review-pr-9012/.hook-inline")" == "inline" ]] || fail "inline hook did not run"
   out=$(w teardown review-pr-9012 --force 2>&1) || fail "teardown after inline-hook test: $out"
 
   jq -n '{tools:{"!codegraph":true}, hooks:{postCreate:".opencode/hooks/nope.sh"}}' > "$cfg"
-  out=$(w new review-pr-1357 2>&1) || fail "a missing hook file must not fail worktree creation: $out"
+  out=$(w new review-pr-1357 --pr 1357 2>&1) || fail "a missing hook file must not fail worktree creation: $out"
   [[ -d "$repo/.git-worktrees/review-pr-1357" ]] || fail "worktree not created with a missing hook"
   grep -qi "warning" <<<"$out" || fail "a missing hook should warn, got: $out"
   out=$(w teardown review-pr-1357 --force 2>&1) || fail "teardown after missing-hook test: $out"
@@ -1201,13 +1234,53 @@ HOOK
   # preTeardown runs before the worktree is removed
   jq -n '{tools:{"!codegraph":true}, hooks:{preTeardown:"touch \"$WT_MAIN_ROOT/.pre-teardown-ran\""}}' > "$cfg"
   rm -f "$repo/.pre-teardown-ran"
-  out=$(w new review-pr-2468 2>&1) || fail "new for preTeardown test: $out"
+  out=$(w new review-pr-2468 --pr 2468 2>&1) || fail "new for preTeardown test: $out"
   out=$(w teardown review-pr-2468 --force 2>&1) || fail "teardown with preTeardown hook: $out"
   [[ -f "$repo/.pre-teardown-ran" ]] || fail "preTeardown hook did not run"
   rm -f "$repo/.pre-teardown-ran"
 
   rm -rf "$repo/.opencode/hooks"; rm -f "$cfg"
   pass "hooks: file form, inline form, env contract, missing file tolerated"
+
+  # source selection via flags
+  jq -n '{tools:{"!codegraph":true}, branchPrefix:"wt/"}' > "$cfg"
+
+  out=$(w new spike-auth 2>&1) || fail "new with no source flag: $out"
+  [[ -d "$repo/.git-worktrees/spike-auth" ]] || fail "plain-name worktree not created"
+  [[ "$(git -C "$repo/.git-worktrees/spike-auth" branch --show-current)" == "wt/spike-auth" ]] \
+    || fail "expected branch wt/spike-auth, got $(git -C "$repo/.git-worktrees/spike-auth" branch --show-current)"
+  out=$(w teardown spike-auth --force 2>&1) || fail "teardown spike-auth: $out"
+
+  out=$(w new audit --pr 3579 2>&1) || fail "new --pr 3579: $out"
+  [[ -d "$repo/.git-worktrees/audit" ]] || fail "--pr worktree not created"
+  out=$(w teardown audit --force 2>&1) || fail "teardown audit: $out"
+
+  out=$(w new --pr 4680 2>&1) || fail "new --pr with no name: $out"
+  [[ -d "$repo/.git-worktrees/pr-4680" ]] || fail "--pr with no name should auto-name pr-4680"
+  out=$(w teardown pr-4680 --force 2>&1) || fail "teardown pr-4680: $out"
+
+  # -a -m and an explicit identity: the fixture must not depend on the user's
+  # global git config (tag.gpgSign / forceSignAnnotated make a bare tag fail)
+  git -C "$tmp/repo" -c tag.gpgSign=false -c user.email=t@t -c user.name=t \
+    tag -f -a -m t v9.9.9 "$default_branch" >/dev/null 2>&1 || fail "could not create tag v9.9.9"
+  out=$(w new hotfix --from v9.9.9 2>&1) || fail "new --from a tag: $out"
+  [[ -d "$repo/.git-worktrees/hotfix" ]] || fail "--from worktree not created"
+  out=$(w teardown hotfix --force 2>&1) || fail "teardown hotfix: $out"
+
+  git -C "$tmp/repo" push -q origin "$default_branch:refs/heads/feat-theirs" || fail "could not push feat-theirs"
+  out=$(w new theirs --branch feat-theirs 2>&1) || fail "new --branch: $out"
+  [[ -d "$repo/.git-worktrees/theirs" ]] || fail "--branch worktree not created"
+  out=$(w teardown theirs --force 2>&1) || fail "teardown theirs: $out"
+
+  out=$(w new x --pr 1 --branch y 2>&1) && fail "two source flags should be rejected"
+  grep -qi "one source" <<<"$out" || fail "error should say only one source is allowed, got: $out"
+
+  out=$(w new nopen --no-open 2>&1) || fail "new --no-open: $out"
+  grep -q "cd \"" <<<"$out" || fail "--no-open should print the cd line, got: $out"
+  out=$(w teardown nopen --force 2>&1) || fail "teardown nopen: $out"
+
+  rm -f "$cfg"
+  pass "new: --pr / --branch / --from / default branch / --no-open"
 
   echo "wt test: $passes groups passed"
 }
