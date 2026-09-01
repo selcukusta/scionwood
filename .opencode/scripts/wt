@@ -1077,6 +1077,12 @@ cmd_teardown() {
       echo "  branch not deleted (checked out elsewhere?): $b"
     fi
   fi
+  # Tearing down the last worktree should leave no trace. rmdir only succeeds on
+  # an empty directory, so a basePath still holding worktrees is left alone.
+  local base
+  base="$(cfg '.basePath')"; base="${base#./}"; base="${base%/}"
+  [[ -n "$base" ]] && rmdir "$main_root/$base" 2>/dev/null || true
+
   echo "teardown complete"
 
   if [[ -n "$invoked_from" && ( "$invoked_from" == "$wt" || "$invoked_from" == "$wt"/* ) ]]; then
@@ -1755,6 +1761,18 @@ HOOK
   out=$(w teardown review-pr-4680 --force 2>&1) || fail "teardown after hook-failure test: $out"
   rm -f "$cfg"
   pass "hook failure: explains the consequence and the recovery, which works"
+
+  # using wt should not leave a stray directory in the user's project
+  # its own basePath, so leftovers from earlier groups cannot mask the result
+  jq -n '{tools:{"!codegraph":true}, basePath:".leftover-trees"}' > "$cfg"
+  out=$(w new review-pr-5678 --pr 5678 2>&1) || fail "new for leftover-dir test: $out"
+  out=$(w new review-pr-6789 --pr 6789 2>&1) || fail "second worktree for leftover-dir test: $out"
+  out=$(w teardown review-pr-5678 2>&1) || fail "teardown 1 of 2: $out"
+  [[ -d "$repo/.leftover-trees" ]] || fail "basePath removed while it still held a worktree"
+  out=$(w teardown review-pr-6789 2>&1) || fail "teardown 2 of 2: $out"
+  [[ ! -d "$repo/.leftover-trees" ]] || fail "empty basePath left behind after the last teardown"
+  rm -f "$cfg"
+  pass "teardown: removes basePath once it is empty, keeps it while in use"
 
   echo "wt test: $passes groups passed"
 }
