@@ -1,6 +1,6 @@
 {
   "name": "scionwood",
-  "version": "0.2.0",
+  "version": "0.1.0",
   "description": "Worktrees for opencode that pull down code you didn't write — each with its own index",
   "type": "module",
   "main": "dist/index.js",

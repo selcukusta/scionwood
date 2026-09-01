@@ -5,7 +5,7 @@ import path from "node:path"
 const SCRIPT_REL = ".opencode/scripts/wt"
 const CONFIG_REL = path.join(".opencode", "wt.json")
 
-// Mirrors the 0.2.0 bash schema (defaults match bash's built-in defaults)
+// Mirrors the bash schema (defaults match bash's built-in defaults)
 export type ToolSpec = {
   detect?: string
   dataDir?: string
