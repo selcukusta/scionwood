@@ -88,6 +88,10 @@ Optionally write your cross-repo defaults:
 wt install     # creates ~/.config/wt/config.json
 ```
 
+`wt install` will not write a second `wt` onto your PATH if npm already put one
+there — it only writes the shim when you are installing from a repository copy
+rather than from npm.
+
 <details>
 <summary>Per-project install instead of global</summary>
 

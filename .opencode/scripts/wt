@@ -63,6 +63,24 @@ EOF
 
 die() { echo "wt: error: $*" >&2; exit 1; }
 
+# Fully resolve a path, following symlink chains. macOS ships neither
+# `readlink -f` nor realpath(1), and plain `readlink` returns the raw target,
+# which is often relative -- so comparing its output directly is wrong.
+resolve_path() { # $1 path
+  local p="$1" d b t
+  d="$(cd "$(dirname "$p")" 2>/dev/null && pwd -P)" || return 1
+  b="$(basename "$p")"
+  while [[ -L "$d/$b" ]]; do
+    t="$(readlink "$d/$b")"
+    case "$t" in
+      /*) d="$(cd "$(dirname "$t")" 2>/dev/null && pwd -P)" || return 1 ;;
+      *)  d="$(cd "$d/$(dirname "$t")" 2>/dev/null && pwd -P)" || return 1 ;;
+    esac
+    b="$(basename "$t")"
+  done
+  echo "$d/$b"
+}
+
 main_root_from() { # $1 start dir, $2 optional basePath marker (default: CFG_BASE_PATH)
   local dir="$1" marker="${2:-}"
   if [[ -z "$marker" ]]; then
@@ -634,8 +652,58 @@ cmd_init() {
     die "config already exists: $cfg_path (use --force to overwrite)"
   fi
   mkdir -p "$(dirname "$cfg_path")" "$hooks"
-  config_defaults_json > "$cfg_path.tmp" && mv "$cfg_path.tmp" "$cfg_path"
-  echo "config written:  $cfg_path"
+  # Not config_defaults_json: init wires the scaffolded hooks up so the repo
+  # works immediately. Scaffolding a hook the config never references would
+  # leave the user with two files and no effect.
+  cat > "$cfg_path.tmp" <<'JSON'
+{
+  "basePath": ".git-worktrees",
+  "branchPrefix": "wt/",
+  "prRef": "pull/{n}/head",
+  "filesToLink": ["CLAUDE.local.md", ".claude/settings.local.json", ".env"],
+  "hooks": {
+    "postCreate": ".opencode/hooks/post-create.sh",
+    "preTeardown": ".opencode/hooks/pre-teardown.sh"
+  }
+}
+JSON
+  mv "$cfg_path.tmp" "$cfg_path"
+
+  if [[ ! -f "$hooks/post-create.sh" ]] || $force; then
+    cat > "$hooks/post-create.sh" <<'HOOK'
+#!/usr/bin/env bash
+# Runs inside a freshly created worktree.
+#   cwd: the worktree
+#   env: WT_NAME  WT_ROOT  WT_MAIN_ROOT  WT_BRANCH
+# Edit freely. A failure here warns but never blocks the worktree.
+set -euo pipefail
+
+if   [ -f pnpm-lock.yaml ];    then pnpm install
+elif [ -f bun.lockb ];         then bun install
+elif [ -f yarn.lock ];         then yarn install
+elif [ -f package-lock.json ]; then npm install
+fi
+HOOK
+    chmod +x "$hooks/post-create.sh"
+  fi
+
+  if [[ ! -f "$hooks/pre-teardown.sh" ]] || $force; then
+    cat > "$hooks/pre-teardown.sh" <<'HOOK'
+#!/usr/bin/env bash
+# Runs inside the worktree just before it is removed.
+#   cwd: the worktree
+#   env: WT_NAME  WT_ROOT  WT_MAIN_ROOT  WT_BRANCH
+# Stop anything this worktree started. Failures warn but never block teardown.
+set -euo pipefail
+
+# example: docker compose down -v
+HOOK
+    chmod +x "$hooks/pre-teardown.sh"
+  fi
+
+  echo "config written:   ${cfg_path#$main_root/}"
+  echo "hooks scaffolded: ${hooks#$main_root/}/post-create.sh, ${hooks#$main_root/}/pre-teardown.sh"
+  echo "the config already points at them -- edit the hooks, not the config"
 }
 
 
@@ -678,6 +746,20 @@ JSON
   mkdir -p "$bin"
 
   wrapper="$bin/wt"
+
+  # If wt already resolves to this exact script -- the normal case after
+  # `npm install -g scionwood` -- writing a shim would put a second wt earlier
+  # on PATH and shadow the package the user actually installed.
+  local existing
+  existing="$(command -v wt 2>/dev/null || true)"
+  if [[ -n "$existing" && "$existing" != "$wrapper" ]]; then
+    if [[ "$(resolve_path "$existing" 2>/dev/null)" == "$(resolve_path "$script" 2>/dev/null)" ]]; then
+      echo "wt is already on your PATH at $existing (same script); no shim written"
+      echo "run wt init inside a repository that needs its own settings"
+      return 0
+    fi
+  fi
+
   cat > "$wrapper" <<EOF
 #!/usr/bin/env bash
 # Deliberately does not pin a repository: wt resolves the repo from the
@@ -1408,6 +1490,38 @@ HOOK
   else
     echo "  skip  docs json check (running outside a checkout)"
   fi
+
+  # wt init must produce a WORKING repo setup, not just a config file.
+  # The README and the removed-field error both promise scaffolded hooks.
+  local initrepo="$tmp/initrepo"
+  mkdir -p "$initrepo" && (cd "$initrepo" && git init -q)
+  out=$(cd "$initrepo" && WT_MAIN_ROOT="$initrepo" bash "$self" init 2>&1) || fail "wt init: $out"
+  [[ -f "$initrepo/.opencode/wt.json" ]] || fail "init did not write the config"
+  [[ -x "$initrepo/.opencode/hooks/post-create.sh" ]] \
+    || fail "init did not scaffold an executable post-create.sh (the docs promise it)"
+  [[ -x "$initrepo/.opencode/hooks/pre-teardown.sh" ]] \
+    || fail "init did not scaffold an executable pre-teardown.sh"
+  [[ "$(jq -r '.hooks.postCreate' "$initrepo/.opencode/wt.json")" == ".opencode/hooks/post-create.sh" ]] \
+    || fail "init's config must reference the hooks it scaffolded, or they are inert"
+  out=$(cd "$initrepo" && WT_MAIN_ROOT="$initrepo" bash "$self" init 2>&1) \
+    && fail "init should refuse to overwrite without --force"
+  pass "init: scaffolds executable hooks and wires them into the config"
+
+  # wt install must not write a shim that shadows an already-working wt.
+  # After `npm install -g scionwood`, wt is already on PATH as a symlink to the
+  # same script; a second wt earlier in PATH would shadow the real package.
+  mkdir -p "$tmp/bin2"
+  ln -sf "$self" "$tmp/bin/wt"
+  out=$(cd "$tmp/repo" && WT_BIN="$tmp/bin2" bash "$self" install 2>&1) || fail "install with wt already present: $out"
+  [[ ! -e "$tmp/bin2/wt" ]] || fail "install wrote a shim that would shadow the already-installed wt"
+  grep -qi "already on your PATH" <<<"$out" || fail "install should say why it skipped the shim, got: $out"
+  rm -f "$tmp/bin/wt"
+
+  # ...but a different script must still be able to take over
+  out=$(cd "$tmp/repo" && WT_BIN="$tmp/bin2" bash "$self" install 2>&1) || fail "install with no existing wt: $out"
+  [[ -x "$tmp/bin2/wt" ]] || fail "install did not write a shim when none existed"
+  rm -rf "$tmp/bin2"
+  pass "install: skips the shim when wt already resolves to this script"
 
   echo "wt test: $passes groups passed"
 }
