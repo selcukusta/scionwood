@@ -44,7 +44,8 @@ env:
                               auto: same tab when run from a terminal, otherwise a new
                               tab (iTerm2) / window (Ghostty) in the current terminal app
                               exec: always same tab   tab: force new tab   none: print only
-  WT_MAIN_ROOT=/path          skip main-repo autodetection
+  WT_MAIN_ROOT=/path          act on this repository instead of the one containing
+                              the current directory (autodetection is the default)
   WT_BIN=/path                install target directory (default: /opt/homebrew/bin,
                               /usr/local/bin or ~/.local/bin)
 
@@ -694,7 +695,8 @@ if [[ ! -t 0 ]] && ! $non_interactive && ! $defaults; then
   wrapper="$bin/wt"
   cat > "$wrapper" <<EOF
 #!/usr/bin/env bash
-export WT_MAIN_ROOT="$repo"
+# Deliberately does not pin a repository: wt resolves the repo from the
+# current directory, like git. Set WT_MAIN_ROOT yourself to override.
 exec "$script" "\$@"
 EOF
   chmod +x "$wrapper"
@@ -706,8 +708,9 @@ EOF
       echo "  export PATH=\"$bin:\$PATH\""
       ;;
   esac
-  echo "installed: $wrapper -> $script (bound to $repo)"
-  echo "usage from any directory: wt new <name> | wt list | wt open <name> | wt teardown <name>"
+  echo "installed: $wrapper -> $script"
+  echo "config written for: $repo"
+  echo "run wt from inside any repository: wt new <name> | wt list | wt open <name> | wt teardown <name>"
 }
 
 clean_artifacts() {
@@ -1013,6 +1016,17 @@ IGNORE
     || fail "bare teardown from inside the worktree: $out"
   [[ ! -d "$repo/.git-worktrees/review-pr-5678" ]] || fail "bare teardown did not remove the worktree"
   pass "bare bootstrap/clean/teardown work from inside a worktree"
+
+  # defect B — the global shim must not be pinned to one repository
+  out=$(w install --reset --defaults --non-interactive 2>&1) || fail "install for shim test: $out"
+  [[ -x "$tmp/bin/wt" ]] || fail "install did not write an executable shim at $tmp/bin/wt"
+  if grep -q "WT_MAIN_ROOT=" "$tmp/bin/wt"; then
+    fail "shim pins WT_MAIN_ROOT; it must resolve the repository from the current directory"
+  fi
+  out=$(cd "$tmp/repo2" && "$tmp/bin/wt" new review-pr-1234 2>&1) || fail "shim new inside repo2: $out"
+  [[ -d "$repo2/.git-worktrees/review-pr-1234" ]] || fail "shim did not create the worktree in repo2"
+  [[ ! -d "$repo/.git-worktrees/review-pr-1234" ]] || fail "shim leaked a worktree into the install-time repository"
+  pass "install: shim resolves the repository from cwd, not from install time"
 
   echo "wt test: $passes groups passed"
 }
