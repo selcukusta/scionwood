@@ -77,12 +77,27 @@ Three steps, once per machine.
 npm install -g scionwood
 ```
 
-**2. Tell opencode to load the plugin.** Add this to your global opencode config
-— `~/.config/opencode/opencode.json`, or `opencode.jsonc` if that is the one you
-have:
+**2. Tell opencode to load the plugin.** Open your global opencode config —
+`~/.config/opencode/opencode.json`, or `opencode.jsonc` if that is the one you
+have — and add `"scionwood"` to the `plugin` array.
+
+If you already have plugins, add it alongside them:
 
 ```json
-{ "plugin": ["scionwood"] }
+{
+  "plugin": [
+    "some-plugin-you-already-had",
+    "scionwood"
+  ]
+}
+```
+
+If the file has no `plugin` key yet, add the whole line:
+
+```json
+{
+  "plugin": ["scionwood"]
+}
 ```
 
 This is what gives each worktree its own code index and its own environment.
