@@ -1,0 +1,9 @@
+.DS_Store
+.env
+.env.*
+!.opencode/**
+node_modules/
+.codegraph*
+.claude/worktrees/
+*.log
+dist/

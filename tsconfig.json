@@ -1,0 +1,23 @@
+{
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "outDir": "dist",
+    "rootDir": ".opencode/plugins",
+    "declaration": true,
+    "declarationMap": false,
+    "sourceMap": false,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "allowSyntheticDefaultImports": true,
+    "forceConsistentCasingInFileNames": true,
+    "lib": ["ESNext"],
+    "types": ["node", "bun-types"]
+  },
+  "include": [".opencode/plugins/sprig-worktree.ts"],
+  "exclude": ["node_modules", "dist", ".opencode/plugins/*.test.ts"]
+}

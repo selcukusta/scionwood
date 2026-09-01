@@ -1,0 +1,21 @@
+{
+  "basePath": ".git-worktrees",
+  "branchPrefix": "review/",
+  "namePattern": "^review-pr-([0-9]+)$",
+  "fetchPrune": true,
+  "pullRebase": true,
+  "filesToLink": [
+    "CLAUDE.local.md",
+    ".claude/settings.local.json",
+    ".env"
+  ],
+  "npmInstallDirs": [
+    ".",
+    "apps/frontend"
+  ],
+  "tools": {
+    "codegraph": {
+      "enabled": true
+    }
+  }
+}

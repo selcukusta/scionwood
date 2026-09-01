@@ -1,0 +1,985 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# install-config defaults (schema for .opencode/wt.json)
+CFG_BASE_PATH=".git-worktrees"
+CFG_BRANCH_PREFIX="review/"
+CFG_NAME_PATTERN="^review-pr-([0-9]+)$"
+CFG_FETCH_PRUNE=true
+CFG_PULL_REBASE=true
+CFG_FILES_TO_LINK=("CLAUDE.local.md" ".claude/settings.local.json" ".env")
+CFG_NPM_DIRS=("." "apps/frontend")
+CFG_CODEGRAPH=true
+_CFG_LOADED=false
+
+usage() {
+  cat <<'EOF'
+usage:
+  wt new <name>                create <basePath>/<name>, bootstrap it, open opencode
+                              <name> must match the configured name pattern (default
+                              'review-pr-1234'); the PR head is fetched from origin
+  wt list                     list review worktrees and their branches
+  wt open <name>              open opencode in an existing review worktree
+  wt bootstrap [name|path]    (re)create ignored-file symlinks + npm install
+                              (configured dirs) + codegraph index
+  wt clean [name|path]        remove worktree artifacts only (symlinks + tool data),
+                              keep the worktree and branch
+  wt teardown [name|path]     remove worktree + branch + codegraph data
+                              name = folder under <basePath> (works from anywhere);
+                              path = direct path; default: cwd
+  wt install [--reset] [--non-interactive] [--defaults] [--config <path>]
+                              write .opencode/wt.json at the repo root (interactive
+                              by default), then install a global 'wt' command bound to
+                              this repository
+                              --reset            wipe config and re-prompt with defaults
+                              --non-interactive  fail if config missing or --reset given
+                              --defaults         only with --non-interactive; write the
+                                                 default config without prompting
+                              --config <path>    override config file location (default:
+                                                 .opencode/wt.json at the main repo root)
+  wt test                     run the built-in smoke tests (throwaway repo, no side effects)
+
+env:
+  WT_OPEN=auto|exec|tab|none  how to launch opencode after "new"/"open" (default: auto)
+                              auto: same tab when run from a terminal, otherwise a new
+                              tab (iTerm2) / window (Ghostty) in the current terminal app
+                              exec: always same tab   tab: force new tab   none: print only
+  WT_MAIN_ROOT=/path          skip main-repo autodetection
+  WT_BIN=/path                install target directory (default: /opt/homebrew/bin,
+                              /usr/local/bin or ~/.local/bin)
+
+config overrides (env vars beat .opencode/wt.json, which beats built-in defaults):
+  WT_BASE=path                worktree base path (default: .git-worktrees)
+  WT_BRANCH_PREFIX=prefix     branch prefix for new worktrees (default: review/)
+  WT_NAME_PATTERN=regex       PR-name pattern, exactly one capture group
+                              (default: ^review-pr-([0-9]+)$)
+  WT_FETCH_PRUNE=y|n|1|0      run 'git fetch --prune' on new (default: y)
+  WT_PULL_REBASE=y|n|1|0      run 'git pull --rebase' on new (default: y)
+  WT_FILES_TO_LINK=a,b        comma-separated files/dirs to symlink into worktrees
+                              (default: CLAUDE.local.md,.claude/settings.local.json,.env)
+  WT_NPM_DIRS=a,b             comma-separated dirs to npm install (default: .,apps/frontend)
+  WT_CODEGRAPH=y|n|1|0        run codegraph indexing on bootstrap (default: y)
+EOF
+  exit 1
+}
+
+die() { echo "wt: error: $*" >&2; exit 1; }
+
+main_root_from() { # $1 start dir, $2 optional basePath marker (default: CFG_BASE_PATH)
+  local dir="$1" marker="${2:-}"
+  if [[ -z "$marker" ]]; then
+    marker="${CFG_BASE_PATH:-.git-worktrees}"
+    marker="${marker#./}"
+    marker="/${marker}"
+  fi
+  if [[ -n "${WT_MAIN_ROOT:-}" && -d "$WT_MAIN_ROOT/.git" ]]; then
+    echo "$WT_MAIN_ROOT"
+    return 0
+  fi
+  while [[ "$dir" != "/" ]]; do
+    if [[ "$dir" != *"$marker"* && -d "$dir/.git" ]]; then
+      echo "$dir"
+      return 0
+    fi
+    dir="$(dirname "$dir")"
+  done
+  return 1
+}
+
+npm_install_dir() {
+  local dir="$1"
+  if [[ ! -f "$dir/package.json" ]]; then
+    echo "  skip  npm install ($(realpath "$dir" 2>/dev/null || echo "$dir")) (no package.json)"
+    return 0
+  fi
+  echo "  npm install ($dir)"
+  if ! (cd "$dir" && npm install --no-fund --no-audit); then
+    echo "wt: warning: npm install failed in $dir" >&2
+  fi
+}
+
+bootstrap_dir() {
+  local wt="$1"
+  local main_root name f d
+  main_root="$(main_root_from "$wt")" || die "could not locate main repository root above $wt"
+  load_config "$main_root"
+  name="$(basename "$wt")"
+
+  for f in ${CFG_FILES_TO_LINK[@]+"${CFG_FILES_TO_LINK[@]}"}; do
+    if [[ ! -e "$main_root/$f" ]]; then
+      echo "  skip  $f (not in main repo)"
+      continue
+    fi
+    if [[ -e "$wt/$f" && ! -L "$wt/$f" ]]; then
+      echo "  skip  $f (real file exists in worktree)"
+      continue
+    fi
+    mkdir -p "$(dirname "$wt/$f")"
+    ln -sfn "$main_root/$f" "$wt/$f"
+    echo "  link  $f -> $main_root/$f"
+  done
+
+  for d in ${CFG_NPM_DIRS[@]+"${CFG_NPM_DIRS[@]}"}; do
+    if [[ "$d" == "." ]]; then
+      npm_install_dir "$wt"
+    else
+      npm_install_dir "$wt/$d"
+    fi
+  done
+
+  if [[ "$CFG_CODEGRAPH" == "true" ]]; then
+    local data_dir="$wt/.codegraph-$name"
+    echo "  codegraph init/sync ($data_dir)"
+    if ! command -v codegraph >/dev/null 2>&1; then
+      echo "wt: warning: 'codegraph' not found on PATH — skipping index (see README Requirements)" >&2
+    elif ! (cd "$wt" && CODEGRAPH_PROJECT_PATH="$wt" CODEGRAPH_DATA_DIR="$data_dir" codegraph init -i && CODEGRAPH_PROJECT_PATH="$wt" CODEGRAPH_DATA_DIR="$data_dir" codegraph sync); then
+      echo "wt: warning: codegraph indexing failed" >&2
+    fi
+  else
+    echo "  skip  codegraph (disabled in config)"
+  fi
+  echo "  bootstrap complete: $wt"
+}
+
+open_in_terminal() {
+  local wt="$1"
+  local mode="${WT_OPEN:-auto}"
+
+  if [[ "$mode" == "none" ]]; then
+    echo "open it:  cd \"$wt\" && opencode"
+    return 0
+  fi
+
+  if [[ "$mode" == "auto" && -t 0 ]] || [[ "$mode" == "exec" ]]; then
+    cd "$wt" && opencode
+    return 0
+  fi
+
+  local esc="$wt"
+  esc="${esc//\\/\\\\}"
+  esc="${esc//\"/\\\"}"
+
+  case "${TERM_PROGRAM:-}" in
+    iTerm.app)
+      if osascript <<APPLESCRIPT >/dev/null 2>&1
+tell application "iTerm2"
+  activate
+  if (count of windows) = 0 then
+    create window with default profile
+  else
+    tell current window to create tab with default profile
+  end if
+  tell current session of current window to write text "cd \"$esc\" && opencode"
+end tell
+APPLESCRIPT
+      then
+        echo "opencode opened in a new iTerm2 tab"
+        return 0
+      fi
+      ;;
+    ghostty)
+      if open -na ghostty --args --working-directory="$wt" -e sh -c "opencode; exec \${SHELL:-/bin/zsh}" >/dev/null 2>&1; then
+        echo "opencode opened in a new Ghostty window"
+        return 0
+      fi
+      ;;
+  esac
+
+  echo "open it:  cd \"$wt\" && opencode"
+}
+
+cmd_new() {
+  local name
+  [[ $# -ge 1 ]] || usage
+  name="$1"
+
+  [[ "$name" != */* ]] || die "worktree name must be a plain folder name, got: $name"
+
+  local main_root
+  main_root="$(main_root_from "$(pwd -P)")" || die "could not locate the main repository (run from inside the repo, or set WT_MAIN_ROOT)"
+  load_config "$main_root"
+
+  if [[ ! "$name" =~ $CFG_NAME_PATTERN ]]; then
+    die "worktree name must match '$CFG_NAME_PATTERN', got: $name"
+  fi
+  local pr_number="${BASH_REMATCH[1]}"
+  local local_branch="${CFG_BRANCH_PREFIX}${name}"
+
+  local wt
+  wt="$main_root/$CFG_BASE_PATH/$name"
+  if [[ -e "$wt" ]]; then
+    die "worktree already exists: $wt"
+  fi
+  mkdir -p "$main_root/$CFG_BASE_PATH"
+
+  if [[ "$CFG_FETCH_PRUNE" == "true" ]]; then
+    git -C "$main_root" fetch --prune
+  else
+    echo "  skipping fetch --prune (per config)"
+  fi
+
+  if [[ "$CFG_PULL_REBASE" == "true" ]]; then
+    if ! git -C "$main_root" pull --rebase; then
+      echo "wt: warning: 'git pull --rebase' failed (no upstream?); continuing" >&2
+    fi
+  else
+    echo "  skipping pull --rebase (per config)"
+  fi
+
+  if ! git -C "$main_root" fetch origin "pull/$pr_number/head:$local_branch"; then
+    die "could not fetch PR #$pr_number from origin (does it exist on GitHub?)"
+  fi
+
+  git -C "$main_root" worktree add "$wt" "$local_branch"
+
+  bootstrap_dir "$wt"
+  open_in_terminal "$wt"
+}
+
+cmd_bootstrap() {
+  local wt
+  wt="$(resolve_worktree_target "$1" | tail -1)"
+  bootstrap_dir "$wt"
+}
+
+cmd_list() {
+  local main_root base d name branch found=""
+  main_root="$(main_root_from "$(pwd -P)")" || die "could not locate the main repository"
+  load_config "$main_root"
+  base="$main_root/$CFG_BASE_PATH"
+  if [[ -d "$base" ]]; then
+    for d in "$base"/*/; do
+      [[ -d "$d" ]] || continue
+      found=1
+      name="$(basename "$d")"
+      branch="$(git -C "$main_root" worktree list --porcelain 2>/dev/null | awk -v w="${d%/}" '
+        /^worktree / { inblock = ($0 == "worktree " w) }
+        inblock && /^branch / { sub(/^branch /, ""); print; exit }
+      ')"
+      branch="${branch#refs/heads/}"
+      echo "  $name  (${branch:-detached})"
+    done
+  fi
+  if [[ -z "$found" ]]; then
+    echo "no review worktrees under $base"
+  fi
+}
+
+cmd_open() {
+  local name="${1:-}"
+  [[ -n "$name" ]] || usage
+  local main_root wt
+  main_root="$(main_root_from "$(pwd -P)")" || die "could not locate the main repository"
+  load_config "$main_root"
+  wt="$main_root/$CFG_BASE_PATH/$name"
+  [[ -d "$wt" ]] || die "worktree not found: $CFG_BASE_PATH/$name (see 'wt list')"
+  open_in_terminal "$wt"
+}
+
+cfg_get() { # $1 cfg file, $2 jq expr (with // fallback), $3 shell fallback
+  local v
+  v="$(jq -r "$2 | tostring" "$1" 2>/dev/null)" || { echo "$3"; return 0; }
+  [[ "$v" == "null" ]] && echo "$3" || echo "$v"
+}
+
+# NOTE: for booleans do NOT pass '// true' as the jq expr — jq's // treats
+# 'false' as falsy and would coerce false back to true. Rely on cfg_get's
+# null/error handling instead (missing key -> shell fallback).
+
+config_set_defaults() {
+  CFG_BASE_PATH=".git-worktrees"
+  CFG_BRANCH_PREFIX="review/"
+  CFG_NAME_PATTERN="^review-pr-([0-9]+)$"
+  CFG_FETCH_PRUNE=true
+  CFG_PULL_REBASE=true
+  CFG_FILES_TO_LINK=("CLAUDE.local.md" ".claude/settings.local.json" ".env")
+  CFG_NPM_DIRS=("." "apps/frontend")
+  CFG_CODEGRAPH=true
+}
+
+config_load() { # $1 cfg file; populates CFG_* globals from existing config
+  local cfg="$1" v
+  CFG_BASE_PATH="$(cfg_get "$cfg" '.basePath // ".git-worktrees"' '.git-worktrees')"
+  CFG_BRANCH_PREFIX="$(cfg_get "$cfg" '.branchPrefix // "review/"' 'review/')"
+  CFG_NAME_PATTERN="$(cfg_get "$cfg" '.namePattern // "^review-pr-([0-9]+)$"' '^review-pr-([0-9]+)$')"
+  CFG_FETCH_PRUNE="$(parse_bool "$(cfg_get "$cfg" '.fetchPrune' true)" "config fetchPrune")"
+  CFG_PULL_REBASE="$(parse_bool "$(cfg_get "$cfg" '.pullRebase' true)" "config pullRebase")"
+  CFG_CODEGRAPH="$(parse_bool "$(cfg_get "$cfg" '.tools.codegraph.enabled' true)" "config tools.codegraph.enabled")"
+  CFG_FILES_TO_LINK=()
+  if jq -e '.filesToLink == null' "$cfg" >/dev/null 2>&1; then
+    CFG_FILES_TO_LINK=("CLAUDE.local.md" ".claude/settings.local.json" ".env")
+  elif jq -e '.filesToLink | type == "array" and (all(type == "string"))' "$cfg" >/dev/null 2>&1; then
+    while IFS= read -r v; do CFG_FILES_TO_LINK+=("$v"); done < <(jq -r '.filesToLink[]' "$cfg")
+  else
+    die "config: filesToLink must be a JSON array of strings (got $(jq -c '.filesToLink' "$cfg")). Edit $cfg and use e.g. [\"CLAUDE.local.md\", \".claude/settings.local.json\", \".env\"]."
+  fi
+  CFG_NPM_DIRS=()
+  if jq -e '.npmInstallDirs == null' "$cfg" >/dev/null 2>&1; then
+    CFG_NPM_DIRS=("." "apps/frontend")
+  elif jq -e '.npmInstallDirs | type == "array" and (all(type == "string"))' "$cfg" >/dev/null 2>&1; then
+    while IFS= read -r v; do CFG_NPM_DIRS+=("$v"); done < <(jq -r '.npmInstallDirs[]' "$cfg")
+  else
+    die "config: npmInstallDirs must be a JSON array of strings (got $(jq -c '.npmInstallDirs' "$cfg")). Edit $cfg and use e.g. [\".\", \"apps/frontend\"]."
+  fi
+}
+
+config_write() { # $1 cfg file; atomically writes CFG_* globals as JSON
+  local cfg="$1" files_json npm_json tools_json json
+  if [[ ${#CFG_FILES_TO_LINK[@]} -eq 0 ]]; then
+    files_json='[]'
+  else
+    files_json="$(printf '%s\n' "${CFG_FILES_TO_LINK[@]}" | jq -R . | jq -s -c .)"
+  fi
+  if [[ ${#CFG_NPM_DIRS[@]} -eq 0 ]]; then
+    npm_json='[]'
+  else
+    npm_json="$(printf '%s\n' "${CFG_NPM_DIRS[@]}" | jq -R . | jq -s -c .)"
+  fi
+  tools_json="$(jq -nc --argjson e "$CFG_CODEGRAPH" '{codegraph: {enabled: $e}}')"
+  json="$(jq -n \
+    --arg basePath "$CFG_BASE_PATH" \
+    --arg branchPrefix "$CFG_BRANCH_PREFIX" \
+    --arg namePattern "$CFG_NAME_PATTERN" \
+    --argjson fetchPrune "$CFG_FETCH_PRUNE" \
+    --argjson pullRebase "$CFG_PULL_REBASE" \
+    --argjson filesToLink "$files_json" \
+    --argjson npmInstallDirs "$npm_json" \
+    --argjson tools "$tools_json" \
+    '{basePath: $basePath, branchPrefix: $branchPrefix, namePattern: $namePattern, fetchPrune: $fetchPrune, pullRebase: $pullRebase, filesToLink: $filesToLink, npmInstallDirs: $npmInstallDirs, tools: $tools}')"
+  mkdir -p "$(dirname "$cfg")"
+  printf '%s\n' "$json" > "$cfg.tmp"
+  mv "$cfg.tmp" "$cfg"
+}
+
+parse_bool() { # $1 value, $2 context; echoes true/false, dies on invalid
+  local v
+  v="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  case "$v" in
+    true|yes|1) echo true ;;
+    false|no|0) echo false ;;
+    *) die "invalid boolean for $2: '$1' (expected true/false/yes/no/1/0)" ;;
+  esac
+}
+
+trim() { # $1 string; prints with leading/trailing whitespace removed
+  local s="$1"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
+}
+
+csv_items() { # $1 comma-separated; prints trimmed non-empty items, one per line
+  local csv="$1" item
+  local -a parts=()
+  local old_ifs="$IFS"
+  IFS=,
+  read -ra parts <<< "$csv"
+  IFS="$old_ifs"
+  for item in ${parts[@]+"${parts[@]}"}; do
+    item="$(trim "$item")"
+    [[ -n "$item" ]] && echo "$item"
+  done
+  return 0
+}
+
+load_config() { # $1 main_root; idempotent: config file -> schema defaults -> env overrides
+  local main_root="$1" cfg
+  if $_CFG_LOADED; then
+    return 0
+  fi
+  cfg="$main_root/.opencode/wt.json"
+  if [[ -f "$cfg" ]]; then
+    if jq -e . "$cfg" >/dev/null 2>&1; then
+      config_load "$cfg"
+    else
+      echo "wt: warning: ignoring invalid config $cfg (using defaults)" >&2
+    fi
+  fi
+  apply_env_overrides
+  _CFG_LOADED=true
+}
+
+apply_env_overrides() { # WT_* env vars (validated) override CFG_*
+  if [[ -n "${WT_BASE:-}" ]]; then
+    CFG_BASE_PATH="$WT_BASE"
+  fi
+  if [[ -n "${WT_BRANCH_PREFIX:-}" ]]; then
+    CFG_BRANCH_PREFIX="$WT_BRANCH_PREFIX"
+  fi
+  if [[ -n "${WT_NAME_PATTERN:-}" ]]; then
+    CFG_NAME_PATTERN="$WT_NAME_PATTERN"
+  fi
+  if [[ -n "${WT_FETCH_PRUNE:-}" ]]; then
+    CFG_FETCH_PRUNE="$(parse_bool "$WT_FETCH_PRUNE" "WT_FETCH_PRUNE")"
+  fi
+  if [[ -n "${WT_PULL_REBASE:-}" ]]; then
+    CFG_PULL_REBASE="$(parse_bool "$WT_PULL_REBASE" "WT_PULL_REBASE")"
+  fi
+  if [[ -n "${WT_FILES_TO_LINK:-}" ]]; then
+    local wt_files
+    wt_files="$(csv_items "$WT_FILES_TO_LINK")"
+    if [[ -n "$wt_files" ]]; then
+      CFG_FILES_TO_LINK=()
+      while IFS= read -r f; do CFG_FILES_TO_LINK+=("$f"); done <<< "$wt_files"
+    else
+      echo "wt: warning: WT_FILES_TO_LINK='$WT_FILES_TO_LINK' parsed to no items (expected comma-separated names); keeping config value" >&2
+    fi
+  fi
+  if [[ -n "${WT_NPM_DIRS:-}" ]]; then
+    local wt_dirs
+    wt_dirs="$(csv_items "$WT_NPM_DIRS")"
+    if [[ -n "$wt_dirs" ]]; then
+      CFG_NPM_DIRS=()
+      while IFS= read -r d; do CFG_NPM_DIRS+=("$d"); done <<< "$wt_dirs"
+    else
+      echo "wt: warning: WT_NPM_DIRS='$WT_NPM_DIRS' parsed to no items (expected comma-separated dirs); keeping config value" >&2
+    fi
+  fi
+  if [[ -n "${WT_CODEGRAPH:-}" ]]; then
+    CFG_CODEGRAPH="$(parse_bool "$WT_CODEGRAPH" "WT_CODEGRAPH")"
+  fi
+}
+
+prompt_bool() { # $1 label, $2 default (true/false)
+  local label="$1" default="$2" disp val
+  if [[ "$default" == "true" ]]; then disp="Y"; else disp="N"; fi
+  while true; do
+    read -rp "  $label [$disp]: " val
+    val="${val:-$disp}"
+    case "$val" in
+      y|Y|yes|YES|true) echo true; return 0 ;;
+      n|N|no|NO|false) echo false; return 0 ;;
+      *) echo "  (answer y or n)" >&2 ;;
+    esac
+  done
+}
+
+multi_pick() { # $1 title, $2 default selection, rest: items
+  # prints the numbered list to stderr, selected items to stdout
+  local title="$1" default="$2"; shift 2
+  local -a items=("$@")
+  local i sel tok from to m dup
+  echo "  $title:" >&2
+  for i in "${!items[@]}"; do
+    echo "    $((i+1)). ${items[$i]}" >&2
+  done
+  read -rp "  choose (e.g. 1,3 / 1-3 / all / none) [${default:-none}]: " sel
+  sel="${sel:-$default}"
+  sel="${sel//,/ }"
+  if [[ "$sel" == "all" ]]; then
+    for i in "${!items[@]}"; do echo "${items[$i]}"; done
+    return 0
+  fi
+  if [[ -z "$sel" || "$sel" == "none" ]]; then
+    return 0
+  fi
+  local -a picked=() tokens=()
+  read -ra tokens <<< "$sel"
+  for tok in ${tokens[@]+"${tokens[@]}"}; do
+    if [[ "$tok" == *-* ]]; then
+      from="${tok%%-*}"; to="${tok##*-}"
+      if [[ "$from" =~ ^[0-9]+$ && "$to" =~ ^[0-9]+$ ]]; then
+        for ((i=from; i<=to; i++)); do
+          dup=0
+          for m in ${picked[@]+"${picked[@]}"}; do [[ "$m" == "$i" ]] && dup=1; done
+          [[ $dup -eq 0 ]] && picked+=("$i")
+        done
+      fi
+    elif [[ "$tok" =~ ^[0-9]+$ ]]; then
+      dup=0
+      for m in ${picked[@]+"${picked[@]}"}; do [[ "$m" == "$tok" ]] && dup=1; done
+      [[ $dup -eq 0 ]] && picked+=("$tok")
+    fi
+  done
+  for tok in ${picked[@]+"${picked[@]}"}; do
+    i=$((tok - 1))
+    if [[ $i -ge 0 && $i -lt ${#items[@]} ]]; then
+      echo "${items[$i]}"
+    fi
+  done
+  return 0
+}
+
+install_config() { # $1 main_root, $2 cfg, $3 reset, $4 non_interactive, $5 defaults
+  local main_root="$1" cfg="$2" reset="$3" non_interactive="$4" defaults="$5"
+  local existing="{}" val rc caps
+
+  if $reset; then
+    existing="{}"
+  elif [[ -f "$cfg" ]]; then
+    if jq -e . "$cfg" >/dev/null 2>&1; then
+      existing="$(cat "$cfg")"
+    else
+      die "existing config is not valid JSON: $cfg (use --reset to overwrite)"
+    fi
+  fi
+
+  if $non_interactive; then
+    if $defaults; then
+      config_set_defaults
+    else
+      if [[ ! -f "$cfg" ]]; then
+        die "no config found at $cfg (run 'wt install' interactively, or use --defaults --non-interactive)"
+      fi
+      config_load "$cfg"
+    fi
+    config_write "$cfg"
+    return 0
+  fi
+
+  # interactive: seed from existing config, else schema defaults
+  if [[ "$existing" != "{}" ]]; then
+    config_load "$cfg"
+  else
+    config_set_defaults
+  fi
+
+  echo "writing config: $cfg (Ctrl-C to abort)"
+
+  while true; do
+    read -rp "  basePath [${CFG_BASE_PATH}]: " val
+    val="${val:-$CFG_BASE_PATH}"
+    if [[ "$val" == /* || "$val" == *..* ]]; then
+      echo "  (invalid: must be a relative path without '..')" >&2
+      continue
+    fi
+    CFG_BASE_PATH="$val"
+    break
+  done
+
+  read -rp "  branchPrefix [${CFG_BRANCH_PREFIX}]: " val
+  CFG_BRANCH_PREFIX="${val:-$CFG_BRANCH_PREFIX}"
+
+  while true; do
+    read -rp "  namePattern [${CFG_NAME_PATTERN}]: " val
+    val="${val:-$CFG_NAME_PATTERN}"
+    rc=0
+    grep -qE "$val" <<<"" 2>/dev/null || rc=$?
+    if [[ $rc -eq 2 ]]; then
+      echo "  (invalid: not a valid regular expression)" >&2
+      continue
+    fi
+    caps="$(printf '%s' "$val" | sed 's/\\[()]/x/g' | grep -o '(' | wc -l | tr -d ' ')"
+    if [[ "$caps" != "1" ]]; then
+      echo "  (invalid: must contain exactly one capture group '(...)')" >&2
+      continue
+    fi
+    CFG_NAME_PATTERN="$val"
+    break
+  done
+
+  CFG_FETCH_PRUNE="$(prompt_bool "fetchPrune" "$CFG_FETCH_PRUNE")"
+  CFG_PULL_REBASE="$(prompt_bool "pullRebase" "$CFG_PULL_REBASE")"
+
+  # filesToLink: pre-detect existing files
+  local -a file_items=() picked=()
+  local f d i have c
+  for f in "CLAUDE.local.md" ".claude/settings.local.json" ".env"; do
+    [[ -e "$main_root/$f" ]] && file_items+=("$f")
+  done
+  for d in "$main_root"/apps/*/; do
+    [[ -d "$d" ]] || continue
+    [[ -e "$d/.env" ]] && file_items+=("apps/$(basename "$d")/.env")
+  done
+  for d in "$main_root"/packages/*/; do
+    [[ -d "$d" ]] || continue
+    [[ -e "$d/.env.local" ]] && file_items+=("packages/$(basename "$d")/.env.local")
+  done
+  for f in ${CFG_FILES_TO_LINK[@]+"${CFG_FILES_TO_LINK[@]}"}; do
+    have=0
+    for c in ${file_items[@]+"${file_items[@]}"}; do [[ "$c" == "$f" ]] && have=1; done
+    [[ $have -eq 0 ]] && file_items+=("$f")
+  done
+  local def=""
+  for f in ${CFG_FILES_TO_LINK[@]+"${CFG_FILES_TO_LINK[@]}"}; do
+    for i in "${!file_items[@]}"; do
+      if [[ "${file_items[$i]}" == "$f" ]]; then
+        [[ -n "$def" ]] && def="$def,"
+        def="$def$((i+1))"
+        break
+      fi
+    done
+  done
+  picked=()
+  while IFS= read -r v; do picked+=("$v"); done < <(multi_pick "filesToLink (detected files in repo)" "$def" ${file_items[@]+"${file_items[@]}"})
+  CFG_FILES_TO_LINK=("${picked[@]+"${picked[@]}"}")
+
+  # npmInstallDirs: pre-detect dirs with package.json
+  local -a npm_items=()
+  [[ -f "$main_root/package.json" ]] && npm_items+=(".")
+  for d in "$main_root"/apps/*/; do
+    [[ -d "$d" ]] || continue
+    [[ -f "$d/package.json" ]] && npm_items+=("apps/$(basename "$d")")
+  done
+  for d in "$main_root"/packages/*/; do
+    [[ -d "$d" ]] || continue
+    [[ -f "$d/package.json" ]] && npm_items+=("packages/$(basename "$d")")
+  done
+  for f in ${CFG_NPM_DIRS[@]+"${CFG_NPM_DIRS[@]}"}; do
+    have=0
+    for c in ${npm_items[@]+"${npm_items[@]}"}; do [[ "$c" == "$f" ]] && have=1; done
+    [[ $have -eq 0 ]] && npm_items+=("$f")
+  done
+  def=""
+  for f in ${CFG_NPM_DIRS[@]+"${CFG_NPM_DIRS[@]}"}; do
+    for i in "${!npm_items[@]}"; do
+      if [[ "${npm_items[$i]}" == "$f" ]]; then
+        [[ -n "$def" ]] && def="$def,"
+        def="$def$((i+1))"
+        break
+      fi
+    done
+  done
+  picked=()
+  while IFS= read -r v; do picked+=("$v"); done < <(multi_pick "npmInstallDirs (dirs with package.json)" "$def" ${npm_items[@]+"${npm_items[@]}"})
+  CFG_NPM_DIRS=("${picked[@]+"${picked[@]}"}")
+
+  CFG_CODEGRAPH="$(prompt_bool "tools.codegraph.enabled" "$CFG_CODEGRAPH")"
+
+  config_write "$cfg"
+  echo "config written: $cfg"
+}
+
+cmd_install() {
+  local reset=false non_interactive=false defaults=false cfg_arg=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --reset) reset=true; shift ;;
+      --non-interactive) non_interactive=true; shift ;;
+      --defaults) defaults=true; shift ;;
+      --config)
+        [[ $# -ge 2 ]] || die "option --config requires a path"
+        cfg_arg="$2"; shift 2 ;;
+      --config=*) cfg_arg="${1#--config=}"; shift ;;
+      *) die "unknown option for install: $1 (see --help)" ;;
+    esac
+  done
+
+  if ! command -v jq >/dev/null 2>&1; then
+    die "'jq' is required (install with: brew install jq)"
+  fi
+  if $defaults && ! $non_interactive; then
+    die "--defaults requires --non-interactive"
+  fi
+  if $non_interactive && ! $defaults && $reset; then
+    die "--reset cannot be combined with --non-interactive without --defaults"
+  fi
+
+if [[ ! -t 0 ]] && ! $non_interactive && ! $defaults; then
+      # Non-interactive environment (npm postinstall, CI, scripts, cron):
+      # auto-default to avoid prompt loops that break on closed stdin.
+      non_interactive=true
+      defaults=true
+    fi
+
+  local script repo bin wrapper main_root cfg
+  script="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+  main_root="${WT_MAIN_ROOT:-$(main_root_from "$(pwd -P)")}" || die "could not locate the main repository"
+  repo="$main_root"
+  cfg="${cfg_arg:-$main_root/.opencode/wt.json}"
+
+  install_config "$main_root" "$cfg" "$reset" "$non_interactive" "$defaults"
+
+  if [[ -n "${WT_BIN:-}" ]]; then
+    bin="$WT_BIN"
+  elif [[ -d "/opt/homebrew/bin" ]]; then
+    bin="/opt/homebrew/bin"
+  elif [[ -w "/usr/local/bin" ]]; then
+    bin="/usr/local/bin"
+  else
+    bin="$HOME/.local/bin"
+  fi
+  mkdir -p "$bin"
+
+  wrapper="$bin/wt"
+  cat > "$wrapper" <<EOF
+#!/usr/bin/env bash
+export WT_MAIN_ROOT="$repo"
+exec "$script" "\$@"
+EOF
+  chmod +x "$wrapper"
+
+  case ":$PATH:" in
+    *":$bin:"*) ;;
+    *)
+      echo "⚠️  $bin is not on your PATH. add this to ~/.zshrc:"
+      echo "  export PATH=\"$bin:\$PATH\""
+      ;;
+  esac
+  echo "installed: $wrapper -> $script (bound to $repo)"
+  echo "usage from any directory: wt new <name> | wt list | wt open <name> | wt teardown <name>"
+}
+
+clean_artifacts() {
+  local wt="$1" f
+  if [[ "$CFG_CODEGRAPH" == "true" ]]; then
+    rm -rf "$wt/.codegraph-$(basename "$wt")" "$wt/.codegraph"
+  fi
+  for f in ${CFG_FILES_TO_LINK[@]+"${CFG_FILES_TO_LINK[@]}"}; do
+    if [[ -L "$wt/$f" ]]; then
+      rm -f "$wt/$f"
+    fi
+  done
+}
+
+resolve_worktree_target() {
+  local target="${1:-}"
+  local main_root wt
+  main_root="$(main_root_from "$(pwd -P)")" || die "could not locate the main repository"
+  load_config "$main_root"
+
+  if [[ -z "$target" ]]; then
+    wt="$(pwd -P)"
+  elif [[ -d "$target" ]]; then
+    wt="$(cd "$target" && pwd -P)"
+  else
+    wt="$main_root/$CFG_BASE_PATH/$target"
+    if [[ ! -d "$wt" ]]; then
+      die "worktree not found: $CFG_BASE_PATH/$target (see 'wt list')"
+    fi
+  fi
+  wt="$(cd "$wt" && pwd -P)"
+  [[ "$wt" == *"/${CFG_BASE_PATH}/"* ]] || die "not a review worktree (expected inside $CFG_BASE_PATH): $wt (see 'wt list')"
+  echo "$wt"
+}
+
+cmd_clean() {
+  local wt
+  wt="$(resolve_worktree_target "$1" | tail -1)"
+  clean_artifacts "$wt"
+  echo "  artifacts cleaned: $wt"
+}
+
+cmd_teardown() {
+  local wt
+  wt="$(resolve_worktree_target "$1" | tail -1)"
+
+  local main_root branch b
+  main_root="$(main_root_from "$wt")" || die "could not locate main repository root above $wt"
+  branch="$(git -C "$wt" worktree list --porcelain 2>/dev/null | awk -v w="$wt" '
+    /^worktree / { inblock = ($0 == "worktree " w) }
+    inblock && /^branch / { sub(/^branch /, ""); print; exit }
+  ' || true)"
+
+  clean_artifacts "$wt"
+
+  git -C "$main_root" worktree remove --force "$wt"
+  echo "  worktree removed: $wt"
+
+  if [[ -n "$branch" ]]; then
+    b="${branch#refs/heads/}"
+    if git -C "$main_root" branch -D "$b" >/dev/null 2>&1; then
+      echo "  branch deleted: $b"
+    else
+      echo "  branch not deleted (checked out elsewhere?): $b"
+    fi
+  fi
+  echo "teardown complete"
+
+  local was_inside=false
+  if [[ "$(pwd -P)" == "$wt" ]]; then
+    was_inside=true
+  fi
+  if $was_inside; then
+    if [[ ! -t 0 && "${WT_OPEN:-auto}" != "none" ]]; then
+      echo "reopening opencode at the repository root..."
+      open_in_terminal "$main_root"
+    else
+      echo "note: you were inside the removed worktree. go back to the repo root:"
+      echo "  cd \"$main_root\""
+    fi
+  fi
+}
+
+cmd_test() {
+  local self
+  self="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+  local passes=0
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' EXIT
+
+  fail() { echo "  FAIL  $*" >&2; exit 1; }
+  pass() { passes=$((passes + 1)); echo "  ok  $1"; }
+
+  mkdir -p "$tmp/bin" "$tmp/repo" "$tmp/remote.git"
+  cat > "$tmp/bin/codegraph" <<STUB
+#!/usr/bin/env bash
+[[ -n "\$CODEGRAPH_DATA_DIR" && -n "\$CODEGRAPH_PROJECT_PATH" ]] || exit 1
+mkdir -p "\$CODEGRAPH_DATA_DIR"
+touch "$tmp/codegraph_called"
+STUB
+  chmod +x "$tmp/bin/codegraph"
+
+  cat > "$tmp/bin/npm" <<'STUB'
+#!/usr/bin/env bash
+[[ -f package.json ]] || exit 1
+mkdir -p node_modules
+STUB
+  chmod +x "$tmp/bin/npm"
+
+  git -C "$tmp/remote.git" init --bare -q
+
+  git -C "$tmp/repo" init -q
+  echo hi > "$tmp/repo/file.txt"
+  echo secrets > "$tmp/repo/.env"
+  echo local > "$tmp/repo/CLAUDE.local.md"
+  mkdir -p "$tmp/repo/apps/frontend"
+  echo '{}' > "$tmp/repo/package.json"
+  echo '{}' > "$tmp/repo/apps/frontend/package.json"
+  git -C "$tmp/repo" add file.txt package.json apps/frontend/package.json
+  git -C "$tmp/repo" -c user.email=t@t -c user.name=t commit -qm init
+
+  local default_branch
+  default_branch="$(git -C "$tmp/repo" branch --show-current)"
+
+  git -C "$tmp/repo" remote add origin "$tmp/remote.git"
+  git -C "$tmp/repo" push -q -u origin "$default_branch"
+  git -C "$tmp/repo" push -q origin "$default_branch:refs/pull/1234/head"
+  git -C "$tmp/repo" push -q origin "$default_branch:refs/pull/2345/head"
+  git -C "$tmp/repo" push -q origin "$default_branch:refs/pull/3456/head"
+  git -C "$tmp/repo" push -q origin "$default_branch:refs/pull/4567/head"
+
+  export PATH="$tmp/bin:$PATH"
+  export WT_OPEN=none
+  export WT_BIN="$tmp/bin"
+  local repo
+  repo="$(cd "$tmp/repo" && pwd -P)"
+  w() { (cd "$tmp/repo" && bash "$self" "$@"); }
+
+  local out
+  out=$(w new review-pr-1234 2>&1) || fail "new review-pr-1234: $out"
+  [[ -d "$repo/$CFG_BASE_PATH/review-pr-1234" ]] || fail "worktree dir missing"
+  [[ "$(git -C "$repo/$CFG_BASE_PATH/review-pr-1234" branch --show-current)" == "review/review-pr-1234" ]] || fail "expected branch review/review-pr-1234"
+  [[ -L "$repo/$CFG_BASE_PATH/review-pr-1234/.env" ]] || fail ".env not symlinked"
+  [[ "$(readlink "$repo/$CFG_BASE_PATH/review-pr-1234/.env")" == "$repo/.env" ]] || fail ".env symlink target wrong"
+  [[ -d "$repo/$CFG_BASE_PATH/review-pr-1234/.codegraph-review-pr-1234" ]] || fail "codegraph data dir missing (env contract broken)"
+  [[ -d "$repo/$CFG_BASE_PATH/review-pr-1234/node_modules" ]] || fail "npm install did not run in root"
+  [[ -d "$repo/$CFG_BASE_PATH/review-pr-1234/apps/frontend/node_modules" ]] || fail "npm install did not run in apps/frontend"
+  pass "new: PR worktree, branch review/review-pr-1234, symlinks, npm install, codegraph env contract"
+
+  out=$(w list 2>&1) || fail "list: $out"
+  grep -q "review-pr-1234" <<<"$out" || fail "list output missing review-pr-1234"
+  pass "list"
+
+  out=$(w clean review-pr-1234 2>&1) || fail "clean review-pr-1234: $out"
+  [[ ! -e "$repo/$CFG_BASE_PATH/review-pr-1234/.env" ]] || fail "clean did not remove symlink"
+  [[ -d "$repo/$CFG_BASE_PATH/review-pr-1234" ]] || fail "clean removed the worktree"
+  pass "clean: artifacts removed, worktree kept"
+
+  out=$(w bootstrap review-pr-1234 2>&1) || fail "bootstrap review-pr-1234: $out"
+  [[ -L "$repo/$CFG_BASE_PATH/review-pr-1234/.env" ]] || fail "bootstrap did not restore symlink"
+  pass "bootstrap: idempotent"
+
+  out=$(w new bad-name 2>&1) && fail "new bad-name should have failed"
+  grep -q "review-pr-" <<<"$out" || fail "error message should mention expected PR name format"
+  pass "new: rejects name without PR number"
+
+  out=$(w new review-pr-99999 2>&1) && fail "new review-pr-99999 should have failed (PR does not exist)"
+  grep -q "PR #99999" <<<"$out" || fail "error message should mention PR number"
+  pass "new: rejects non-existent PR"
+
+  out=$(cd "$tmp" && WT_MAIN_ROOT="$tmp/repo" bash "$self" teardown review-pr-1234 2>&1) || fail "teardown by name from outside: $out"
+  [[ ! -d "$repo/$CFG_BASE_PATH/review-pr-1234" ]] || fail "worktree not removed"
+  if git -C "$tmp/repo" branch --list "review/review-pr-1234" | grep -q .; then
+    fail "branch review/review-pr-1234 not deleted"
+  fi
+  pass "teardown: by name with WT_MAIN_ROOT (installed-wrapper contract)"
+
+  local cfg="$repo/.opencode/wt.json"
+  out=$(w install --defaults --non-interactive 2>&1) || fail "install --defaults --non-interactive: $out"
+  [[ -f "$cfg" ]] || fail "install did not write $cfg"
+  jq -e . "$cfg" >/dev/null 2>&1 || fail "wt.json is not valid JSON"
+  [[ "$(jq -r .basePath "$cfg")" == ".git-worktrees" ]] || fail "basePath default mismatch: $(jq -r .basePath "$cfg")"
+  [[ "$(jq -r .branchPrefix "$cfg")" == "review/" ]] || fail "branchPrefix default mismatch"
+  [[ "$(jq -r .namePattern "$cfg")" == "^review-pr-([0-9]+)$" ]] || fail "namePattern default mismatch"
+  [[ "$(jq -r .fetchPrune "$cfg")" == "true" ]] || fail "fetchPrune default mismatch"
+  [[ "$(jq -r .pullRebase "$cfg")" == "true" ]] || fail "pullRebase default mismatch"
+  [[ "$(jq -r '.filesToLink | join(",")' "$cfg")" == "CLAUDE.local.md,.claude/settings.local.json,.env" ]] || fail "filesToLink default mismatch"
+  [[ "$(jq -r '.npmInstallDirs | join(",")' "$cfg")" == ".,apps/frontend" ]] || fail "npmInstallDirs default mismatch"
+  [[ "$(jq -r '.tools.codegraph.enabled' "$cfg")" == "true" ]] || fail "tools.codegraph.enabled default mismatch"
+  pass "install: writes default wt.json config (all fields)"
+
+  out=$(w install --defaults --non-interactive 2>&1) || fail "second install --defaults --non-interactive: $out"
+  [[ "$(jq -r .basePath "$cfg")" == ".git-worktrees" ]] || fail "idempotency: basePath changed"
+  [[ "$(jq -r '.filesToLink | join(",")' "$cfg")" == "CLAUDE.local.md,.claude/settings.local.json,.env" ]] || fail "idempotency: filesToLink changed"
+  pass "install: idempotent (exit 0, values unchanged)"
+
+  jq '.basePath = ".wt/worktrees"' "$cfg" > "$cfg.tmp" && mv "$cfg.tmp" "$cfg"
+  [[ "$(jq -r .basePath "$cfg")" == ".wt/worktrees" ]] || fail "manual overwrite of basePath failed"
+  out=$(w install --reset --defaults --non-interactive 2>&1) || fail "install --reset --defaults --non-interactive: $out"
+  [[ "$(jq -r .basePath "$cfg")" == ".git-worktrees" ]] || fail "--reset did not restore default basePath"
+  pass "install: --reset restores defaults over a modified config"
+
+  rm -f "$cfg"
+  out=$(w install --non-interactive 2>&1) && fail "install --non-interactive without config should have failed"
+  grep -qiE "jq|config" <<<"$out" || fail "error should mention jq or config, got: $out"
+  pass "install: --non-interactive dies without a config"
+
+  # install: rejects filesToLink as a string (must die with an actionable message)
+  local badcfg="$tmp/badcfg"
+  mkdir -p "$badcfg/.opencode"
+  (cd "$badcfg" && git init -q)
+  echo '{"basePath":".git-worktrees","branchPrefix":"review/","namePattern":"^review-pr-([0-9]+)$","fetchPrune":true,"pullRebase":true,"filesToLink":"1","npmInstallDirs":["."],"tools":{"codegraph":{"enabled":true}}}' > "$badcfg/.opencode/wt.json"
+  out=$(cd "$badcfg" && WT_MAIN_ROOT="$badcfg" bash "$self" install --non-interactive 2>&1) && fail "install: filesToLink as a string should have been rejected"
+  grep -q "filesToLink must be a JSON array" <<<"$out" || fail "install: expected 'filesToLink must be a JSON array', got: $out"
+  pass "install: rejects filesToLink as a string"
+
+  # install: rejects filesToLink as a comma-separated string
+  echo '{"filesToLink":"1,2,3,4","npmInstallDirs":["."]}' > "$badcfg/.opencode/wt.json"
+  out=$(cd "$badcfg" && WT_MAIN_ROOT="$badcfg" bash "$self" install --non-interactive 2>&1) && fail "install: filesToLink as a comma-separated string should have been rejected"
+  grep -q "filesToLink must be a JSON array" <<<"$out" || fail "install: expected 'filesToLink must be a JSON array', got: $out"
+  pass "install: rejects filesToLink as comma-separated string"
+
+  # install: rejects npmInstallDirs as a string (must die with an actionable message)
+  echo '{"filesToLink":["CLAUDE.local.md"],"npmInstallDirs":"."}' > "$badcfg/.opencode/wt.json"
+  out=$(cd "$badcfg" && WT_MAIN_ROOT="$badcfg" bash "$self" install --non-interactive 2>&1) && fail "install: npmInstallDirs as a string should have been rejected"
+  grep -q "npmInstallDirs must be a JSON array" <<<"$out" || fail "install: expected 'npmInstallDirs must be a JSON array', got: $out"
+  pass "install: rejects npmInstallDirs as a string"
+
+  jq -n '{basePath: ".wt-trees"}' > "$cfg"
+  out=$(w new review-pr-1234 2>&1) || fail "new (config basePath .wt-trees): $out"
+  [[ -d "$repo/.wt-trees/review-pr-1234" ]] || fail "worktree not at configured basePath .wt-trees"
+  [[ "$(git -C "$repo/.wt-trees/review-pr-1234" branch --show-current)" == "review/review-pr-1234" ]] || fail "branch wrong with configured basePath"
+  pass "config: custom basePath creates worktree there"
+
+  jq -n '{tools: {codegraph: {enabled: false}}}' > "$cfg"
+  rm -f "$tmp/codegraph_called"
+  out=$(w new review-pr-2345 2>&1) || fail "new (codegraph disabled): $out"
+  [[ -d "$repo/.git-worktrees/review-pr-2345" ]] || fail "worktree not created with codegraph disabled"
+  [[ ! -e "$repo/.git-worktrees/review-pr-2345/.codegraph-review-pr-2345" ]] || fail "codegraph data dir created despite disabled"
+  [[ ! -f "$tmp/codegraph_called" ]] || fail "codegraph binary invoked despite disabled"
+  pass "config: codegraph disabled skips indexing"
+
+  jq -n '{fetchPrune: false, pullRebase: false}' > "$cfg"
+  out=$(w new review-pr-3456 2>&1) || fail "new (fetch/pull off): $out"
+  [[ -d "$repo/.git-worktrees/review-pr-3456" ]] || fail "worktree not created with fetchPrune/pullRebase off"
+  [[ "$(git -C "$repo/.git-worktrees/review-pr-3456" branch --show-current)" == "review/review-pr-3456" ]] || fail "branch wrong with fetch/pull off"
+  pass "config: fetchPrune/pullRebase off still creates worktree"
+
+  jq -n '{basePath: ".cfg-trees"}' > "$cfg"
+  out=$(cd "$tmp/repo" && WT_BASE=.env-trees bash "$self" new review-pr-4567 2>&1) || fail "new with WT_BASE override: $out"
+  [[ -d "$repo/.env-trees/review-pr-4567" ]] || fail "worktree not at WT_BASE override .env-trees"
+  [[ ! -d "$repo/.cfg-trees/review-pr-4567" ]] || fail "env override did not win over config basePath"
+  pass "config: WT_BASE env var overrides config basePath"
+
+  jq -n '{branchPrefix: "pr/", namePattern: "^pull-([0-9]+)$"}' > "$cfg"
+  out=$(w new pull-1234 2>&1) || fail "new pull-1234 (custom name pattern): $out"
+  [[ -d "$repo/.git-worktrees/pull-1234" ]] || fail "worktree not created for pull-1234"
+  [[ "$(git -C "$repo/.git-worktrees/pull-1234" branch --show-current)" == "pr/pull-1234" ]] || fail "expected branch pr/pull-1234"
+  pass "config: branchPrefix + namePattern drive naming"
+
+  echo "wt test: $passes groups passed"
+}
+
+case "${1:-}" in
+  new) shift; cmd_new "$@" ;;
+  list) shift; cmd_list "$@" ;;
+  open) shift; cmd_open "$@" ;;
+  install) shift; cmd_install "$@" ;;
+  bootstrap) shift; cmd_bootstrap "$@" ;;
+  clean) shift; cmd_clean "$@" ;;
+  teardown) shift; cmd_teardown "$@" ;;
+  test) shift; cmd_test "$@" ;;
+  -h|--help|help|"") usage ;;
+  *) die "unknown command: $1 (see --help)" ;;
+esac

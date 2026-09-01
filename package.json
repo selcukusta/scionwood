@@ -1,0 +1,61 @@
+{
+  "name": "sprig-worktree",
+  "version": "0.1.5",
+  "description": "A sprig of your repo for worktrees — instant isolated environments for PR review, with codegraph integration",
+  "type": "module",
+  "main": "dist/index.js",
+  "module": "dist/index.js",
+  "types": "dist/plugin.d.ts",
+  "bin": {
+    "wt": "dist/scripts/wt"
+  },
+  "files": [
+    "dist"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/plugin.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./wt": "./dist/scripts/wt"
+  },
+  "scripts": {
+    "build": "tsc && node scripts/build.mjs",
+    "build:clean": "rm -rf dist && npm run build",
+    "test": "bun test ./.opencode/plugins/sprig-worktree.test.ts && bash .opencode/scripts/wt test",
+    "test:plugin": "bun test ./.opencode/plugins/sprig-worktree.test.ts",
+    "test:bash": "bash .opencode/scripts/wt test",
+    "prepare": "npm run build",
+    "prepublishOnly": "npm run test"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "worktree",
+    "git-worktree",
+    "pr-review"
+  ],
+  "author": {
+    "name": "Selçuk Usta",
+    "email": "selcukusta@gmail.com"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/selcukusta/sprig-worktree.git"
+  },
+  "bugs": {
+    "url": "https://github.com/selcukusta/sprig-worktree/issues"
+  },
+  "homepage": "https://github.com/selcukusta/sprig-worktree#readme",
+  "engines": {
+    "node": ">=18",
+    "bun": ">=1.3"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "*",
+    "@types/node": "*",
+    "bun-types": "*",
+    "typescript": "*"
+  }
+}
