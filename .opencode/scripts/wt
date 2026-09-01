@@ -280,6 +280,38 @@ cmd_open() {
   open_in_terminal "$wt"
 }
 
+require_jq() {
+  command -v jq >/dev/null 2>&1 \
+    || die "'jq' is required (install with: brew install jq)"
+}
+
+# Reads one JSON document per line on stdin, prints the merged document.
+# Layer order is lowest precedence first.
+#
+#   objects  merge by key, recursively
+#   arrays   union preserving first-seen order; a "!x" entry in a later layer
+#            removes an inherited "x"
+#   null     in a later layer does not clobber an earlier value
+#   false    is a value, not an absence (the classic `//` bug)
+config_merge() {
+  require_jq
+  jq -c -s '
+    def uniq: reduce .[] as $x ([]; if index([$x]) then . else . + [$x] end);
+
+    def merge($a; $b):
+      if   $b == null then $a
+      elif ($a|type) == "object" and ($b|type) == "object" then
+        reduce ($b|keys_unsorted[]) as $k ($a; .[$k] = merge($a[$k]; $b[$k]))
+      elif ($a|type) == "array" and ($b|type) == "array" then
+        ( ($a + ($b | map(select((type=="string" and startswith("!")) | not)))) | uniq ) as $u
+        | ( $b | map(select(type=="string" and startswith("!")) | .[1:]) ) as $rm
+        | ( $u | map(. as $x | select(($rm | index([$x])) == null)) )
+      else $b end;
+
+    reduce .[1:][] as $layer (.[0]; merge(.; $layer))
+  '
+}
+
 cfg_get() { # $1 cfg file, $2 jq expr (with // fallback), $3 shell fallback
   local v
   v="$(jq -r "$2 | tostring" "$1" 2>/dev/null)" || { echo "$3"; return 0; }
@@ -1156,6 +1188,21 @@ IGNORE
     || fail "recovery notice should fire from a nested directory too, got: $out"
   pass "teardown: cwd recovery notice fires from the worktree and its subdirectories"
 
+  # config merge semantics — objects by key, arrays union, ! removes
+  m() { printf '%s\n' "$@" | (cd "$tmp/repo" && bash "$self" __merge); }
+
+  [[ "$(m '{"tools":{"cg":{"d":1}}}' '{"tools":{"dk":{"d":2}}}')" \
+     == '{"tools":{"cg":{"d":1},"dk":{"d":2}}}' ]] || fail "merge: maps must merge by key"
+  [[ "$(m '{"f":["a",".env"]}' '{"f":[".env.test","!.env"]}')" \
+     == '{"f":["a",".env.test"]}' ]] || fail "merge: ! must remove an inherited array entry"
+  [[ "$(m '{"f":["a","b","c"]}' '{"f":["b","d"]}')" \
+     == '{"f":["a","b","c","d"]}' ]] || fail "merge: arrays must union in order without duplicates"
+  [[ "$(m '{"p":"x"}' '{"p":null}')" == '{"p":"x"}' ]] || fail "merge: null must not clobber"
+  [[ "$(m '{"p":true}' '{"p":false}')" == '{"p":false}' ]] || fail "merge: false must win over true"
+  [[ "$(m '{"f":["a"]}' '{"f":["!ghost"]}')" == '{"f":["a"]}' ]] || fail "merge: removing an absent entry is a no-op"
+  [[ "$(m '{"a":1}' '{"b":2}' '{"c":3}')" == '{"a":1,"b":2,"c":3}' ]] || fail "merge: must fold any number of layers"
+  pass "config: merge semantics (maps, arrays, ! removal, null, false)"
+
   echo "wt test: $passes groups passed"
 }
 
@@ -1168,6 +1215,7 @@ case "${1:-}" in
   clean) shift; cmd_clean "$@" ;;
   teardown) shift; cmd_teardown "$@" ;;
   test) shift; cmd_test "$@" ;;
+  __merge) shift; config_merge ;;
   -h|--help|help|"") usage ;;
   *) die "unknown command: $1 (see --help)" ;;
 esac
