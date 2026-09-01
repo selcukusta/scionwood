@@ -727,9 +727,10 @@ clean_artifacts() {
 
 resolve_worktree_target() {
   local target="${1:-}"
-  local main_root wt
+  local main_root wt base registered m found
   main_root="$(main_root_from "$(pwd -P)")" || die "could not locate the main repository"
   load_config "$main_root"
+  main_root="$(cd "$main_root" && pwd -P)"
 
   if [[ -z "$target" ]]; then
     wt="$(pwd -P)"
@@ -742,7 +743,27 @@ resolve_worktree_target() {
     fi
   fi
   wt="$(cd "$wt" && pwd -P)"
-  [[ "$wt" == *"/${CFG_BASE_PATH}/"* ]] || die "not a review worktree (expected inside $CFG_BASE_PATH): $wt (see 'wt list')"
+
+  [[ "$wt" != "$main_root" ]] || die "refusing to act on the main repository: $wt"
+
+  base="${CFG_BASE_PATH#./}"
+  base="${base%/}"
+  [[ "$wt" == "$main_root/$base/"* ]] \
+    || die "not a worktree of this repository (expected under $main_root/$base): $wt (see 'wt list')"
+
+  # must be a worktree git actually knows about, in THIS repository
+  registered="$(git -C "$main_root" worktree list --porcelain 2>/dev/null \
+    | awk '/^worktree /{sub(/^worktree /,""); print}')"
+  found=1
+  while IFS= read -r m; do
+    [[ -n "$m" ]] || continue
+    if [[ "$m" == "$wt" ]] || [[ "$(cd "$m" 2>/dev/null && pwd -P)" == "$wt" ]]; then
+      found=0
+      break
+    fi
+  done <<< "$registered"
+  [[ $found -eq 0 ]] || die "not a registered worktree of $main_root: $wt (see 'wt list')"
+
   echo "$wt"
 }
 
@@ -1027,6 +1048,24 @@ IGNORE
   [[ -d "$repo2/.git-worktrees/review-pr-1234" ]] || fail "shim did not create the worktree in repo2"
   [[ ! -d "$repo/.git-worktrees/review-pr-1234" ]] || fail "shim leaked a worktree into the install-time repository"
   pass "install: shim resolves the repository from cwd, not from install time"
+
+  # defect B2 — a worktree belonging to another repository must be refused
+  out=$(w install --reset --defaults --non-interactive 2>&1) || fail "reset config for ownership tests: $out"
+  [[ -d "$repo2/.git-worktrees/review-pr-1234" ]] || fail "ownership test needs repo2's worktree from the shim test"
+
+  out=$(cd "$tmp/repo" && bash "$self" teardown "$repo2/.git-worktrees/review-pr-1234" 2>&1) \
+    && fail "teardown accepted a worktree belonging to another repository"
+  [[ -d "$repo2/.git-worktrees/review-pr-1234" ]] || fail "refused teardown still removed the other repository's worktree"
+
+  out=$(cd "$tmp/repo" && bash "$self" teardown "$repo" 2>&1) \
+    && fail "teardown accepted the main repository itself"
+  [[ -d "$repo/.git" ]] || fail "teardown damaged the main repository"
+
+  mkdir -p "$repo/.git-worktrees/not-a-worktree"
+  out=$(cd "$tmp/repo" && bash "$self" teardown not-a-worktree 2>&1) \
+    && fail "teardown accepted a plain directory that is not a registered worktree"
+  rm -rf "$repo/.git-worktrees/not-a-worktree"
+  pass "teardown: refuses other repositories, the main repo, and unregistered directories"
 
   echo "wt test: $passes groups passed"
 }
