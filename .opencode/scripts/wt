@@ -68,15 +68,19 @@ die() { echo "wt: error: $*" >&2; exit 1; }
 # `readlink -f` nor realpath(1), and plain `readlink` returns the raw target,
 # which is often relative -- so comparing its output directly is wrong.
 cmd_version() {
-  local root v
-  root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." 2>/dev/null && pwd -P)" || root=""
+  local self root v
+  # Resolve symlinks first: installed via npm, wt on PATH is a symlink into
+  # node_modules, and BASH_SOURCE is the symlink -- so deriving the package root
+  # from it lands somewhere with no package.json.
+  self="$(resolve_path "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
+  root="$(cd "$(dirname "$self")/../.." 2>/dev/null && pwd -P)" || root=""
   if [[ -n "$root" && -f "$root/package.json" ]] && command -v jq >/dev/null 2>&1; then
     v="$(jq -r '.version // empty' "$root/package.json" 2>/dev/null)"
   fi
   echo "scionwood ${v:-unknown}"
   # Print the path too: more than one wt on PATH is a real and confusing
   # situation, and this is the fastest way to see which one you are running.
-  echo "  cli: $(resolve_path "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
+  echo "  cli: $self"
 }
 
 resolve_path() { # $1 path
@@ -1603,7 +1607,17 @@ HOOK
   out=$(w --version 2>&1) || fail "wt --version: $out"
   grep -q "scionwood" <<<"$out" || fail "--version should name the tool, got: $out"
   grep -q "$self" <<<"$out" || fail "--version should show which wt is running, got: $out"
-  pass "--version: reports the version and the running script"
+  grep -qE "scionwood [0-9]+\.[0-9]+\.[0-9]+" <<<"$out" \
+    || fail "--version should report a real version, got: $out"
+
+  # npm puts wt on PATH as a SYMLINK into node_modules. Running the script by
+  # its real path hid a bug where the package root was derived from the symlink.
+  ln -sf "$self" "$tmp/bin/wt-symlinked"
+  out=$(cd "$tmp/repo" && "$tmp/bin/wt-symlinked" --version 2>&1) || fail "--version via symlink: $out"
+  grep -qE "scionwood [0-9]+\.[0-9]+\.[0-9]+" <<<"$out" \
+    || fail "--version must resolve the package root through a symlink, got: $out"
+  rm -f "$tmp/bin/wt-symlinked"
+  pass "--version: reports the version and the running script, symlinked or not"
 
   echo "wt test: $passes groups passed"
 }
