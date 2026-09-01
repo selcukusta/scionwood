@@ -297,8 +297,8 @@ npm test
 ```bash
 git clone https://github.com/selcukusta/scionwood
 cd scionwood
-npm install     # builds via `prepare`
-npm run build   # rebuild after editing .opencode/plugins/*.ts
+npm install     # dev dependencies
+npm run build   # dist/ is built here, and again automatically on pack/publish
 npm test        # bun + bash
 npm pack --dry-run   # verify the published tarball
 

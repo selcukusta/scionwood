@@ -22,10 +22,10 @@
   "scripts": {
     "build": "tsc && node scripts/build.mjs",
     "build:clean": "rm -rf dist && npm run build",
+    "prepack": "npm run build",
     "test": "bun test ./.opencode/plugins/scionwood.test.ts && bash .opencode/scripts/wt test",
     "test:plugin": "bun test ./.opencode/plugins/scionwood.test.ts",
     "test:bash": "bash .opencode/scripts/wt test",
-    "prepare": "npm run build",
     "prepublishOnly": "npm run test"
   },
   "keywords": [
