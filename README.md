@@ -1,56 +1,108 @@
-<p align="center"><img src="./assets/sprig-worktree-logo.png" alt="sprig-worktree logo" width="400"></p>
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="./assets/scionwood-mark-dark.svg">
+    <img src="./assets/scionwood-mark-light.svg" alt="scionwood" width="110">
+  </picture>
+</p>
 
-# sprig-worktree
+<h1 align="center">scionwood</h1>
 
-> A sprig of your repo for worktrees — instant isolated environments for PR review, with codegraph integration.
+<p align="center">
+  Worktrees for <a href="https://opencode.ai">opencode</a> that pull down code you didn't write — each with its own index.
+</p>
 
-PR-review worktrees for [opencode](https://opencode.ai). One command creates an isolated worktree with its own codegraph index and symlinks to your ignored files; one command tears it down. The LLM never touches worktree management — no tokens, no non-determinism.
+---
 
-## Why
+In grafting, *scionwood* is the cuttings you take from another tree to join onto
+your own. That is what this does with a pull request.
 
-Reviewing a PR in opencode today means juggling the worktree, the codegraph reindex, the symlinks to `.env` / `CLAUDE.local.md`, and the cleanup. Every step is a place to forget. This toolkit turns the whole cycle into two commands.
+```bash
+wt new audit --pr 1234    # isolated worktree, own index, your .env linked, deps installed
+wt teardown audit         # gone — and it won't let you lose uncommitted work
+```
 
-Inspired by the worktree + bootstrap/teardown flow of Spotify's Xirp for Claude Code, reimplemented natively for opencode.
+Not only pull requests:
+
+```bash
+wt new spike-auth               # branch from the default branch
+wt new hotfix --from v2.1.0     # from a tag
+wt new theirs --branch feat-x   # track a remote branch
+```
+
+## Why this one
+
+Several worktree plugins exist for opencode. Four things this one does that they
+do not:
+
+**1. Worktrees for code you didn't write.** `--pr 1234` fetches the pull request
+itself. Every other plugin branches from your local HEAD. `prRef` makes the same
+flow work on GitLab, Gitea and Bitbucket.
+
+**2. Each worktree gets its own tools.** A `tools` entry gives a worktree its own
+code index, its own docker compose project, its own anything — six lines of
+config, no code. See [docs/extending.md](docs/extending.md).
+
+**3. Zero tokens.** The plugin never invokes the model. It registers no tool,
+injects nothing into any prompt, and ships no slash commands — its whole surface
+is three non-model hooks that set environment variables and a permission rule.
+Other plugins hand the agent a `worktree_create` tool and spend model tokens on
+every decision. A test enforces this.
+
+**4. It refuses to destroy your work.** `wt teardown` checks for uncommitted
+changes and unmerged commits and stops, instead of discarding them.
+
+### What the others do better
+
+[opencode-worktree](https://github.com/kdcokenny/opencode-worktree) has
+cross-platform terminal spawning, auto-commit on delete, and tmux/cmux
+integration. [open-trees](https://github.com/0xSero/open-trees) keeps a cross-repo
+session registry. Both let the agent drive worktrees, which is the right choice if
+that is what you want. This one is macOS-first and deliberately user-driven.
+
+Inspired by the worktree + bootstrap/teardown flow of Spotify's Xirp for Claude
+Code, reimplemented natively for opencode.
 
 ## Install
 
-### Option A — copy the toolkit (recommended)
-
-Copy `.opencode/` into your project repo and commit it:
+Once per machine:
 
 ```bash
-git clone https://github.com/selcukusta/sprig-worktree /tmp/sprig
-cp -R /tmp/sprig/.opencode .
-rm -rf /tmp/sprig
-git add .opencode && git commit -m "add sprig-worktree"
+npm install -g scionwood
 ```
 
-Then install once per machine, and optionally once per repository:
+That puts `wt` on your PATH. Then register the plugin in your **global** opencode
+config, `~/.config/opencode/opencode.json`, so it loads in every repository:
+
+```json
+{ "plugin": ["scionwood"] }
+```
+
+Optionally write your cross-repo defaults:
 
 ```bash
-.opencode/scripts/wt install   # machine: the global `wt` command + ~/.config/wt/config.json
-wt init                        # repository: .opencode/wt.json + hook scaffolds (only if it needs its own settings)
+wt install     # creates ~/.config/wt/config.json
 ```
 
-`wt install` never writes into a repository, and `wt init` never writes outside
-one. Most repositories need no config at all — the built-in defaults plus your
-global config are enough.
-
-The global wrapper is deliberately **not** bound to the repository you installed it from. It `exec`s the script and lets `wt` find the repository from your current directory, the way `git` does — so one install serves every repo you own, and `wt new` can never create a worktree in the wrong one.
-
-### Option B — npm
+<details>
+<summary>Per-project install instead of global</summary>
 
 ```bash
-npm install --save-dev sprig-worktree
+npm install --save-dev scionwood
+npx wt install          # puts the global `wt` command in place
 ```
 
-The package exposes `dist/plugin.js` (opencode plugin entry, default-exported) and `dist/scripts/wt` (the bash CLI). Configure your opencode `plugin` list to load it from `node_modules`. On the first opencode session inside your repo, the plugin auto-runs `wt install` to write `.opencode/wt.json` and the global `wt` shim — it finds the bundled bash at `node_modules/sprig-worktree/dist/scripts/wt` automatically, so you don't need to copy anything. After that, `wt` works from any directory via the package's `bin` entry.
+and add `"plugin": ["scionwood"]` to the project's `opencode.json`.
+</details>
 
-> **Note on npm v11+**: this package intentionally has **no** `postinstall` script. Recent npm versions block unfamiliar postinstall scripts by default (via `npm approve-scripts`), which would leave the package unconfigured after install. Instead, the plugin auto-bootstraps on the first opencode session — no script approval needed.
+Per repository — only when a repo needs its own settings:
 
-### First-run behavior
+```bash
+wt init        # writes .opencode/wt.json and scaffolds .opencode/hooks/*.sh
+```
 
-The plugin detects first use inside your repo (including right after a fresh `npm install`) and runs `wt install` for you, creating `.opencode/wt.json` with the recommended defaults and writing the global `wt` shim. In a TTY session you'll see prompts — press Enter through them to accept each default. Subsequent opens load it directly. No manual bootstrap step is required unless you want to review or customize the defaults first.
+Most repositories need neither. Built-in defaults plus your
+`~/.config/wt/config.json` are enough, and `wt new` works with no config at all.
+
 
 ## Quick start
 
@@ -206,7 +258,7 @@ wt test
 
 # Plugin unit tests (42 tests, requires bun)
 npm test
-# or: bun test ./.opencode/plugins/sprig-worktree.test.ts
+# or: bun test ./.opencode/plugins/scionwood.test.ts
 ```
 
 `wt test` builds a throwaway repo and exercises the full cycle — config write, install, worktree creation, symlinks, codegraph env contract, listing, clean, idempotent bootstrap, teardown. Run it after any change to the bash script.
@@ -222,15 +274,15 @@ npm test
 ## For contributors
 
 ```bash
-git clone https://github.com/selcukusta/sprig-worktree
-cd sprig-worktree
+git clone https://github.com/selcukusta/scionwood
+cd scionwood
 npm install     # builds via `prepare`
 npm run build   # rebuild after editing .opencode/plugins/*.ts
 npm test        # bun + bash
 npm pack --dry-run   # verify the published tarball
 ```
 
-The package is `sprig-worktree`. The build emits `dist/plugin.js`, `dist/plugin.d.ts`, `dist/index.js` (default-export wrapper), and `dist/scripts/wt` (executable bash CLI).
+The package is `scionwood`. The build emits `dist/plugin.js`, `dist/plugin.d.ts`, `dist/index.js` (default-export wrapper), and `dist/scripts/wt` (executable bash CLI).
 
 ## License
 
