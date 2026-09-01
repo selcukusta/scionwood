@@ -102,6 +102,75 @@ npm_install_dir() {
   fi
 }
 
+tool_names() { jq -r '(.tools // {}) | keys_unsorted[]' <<<"$WT_CONFIG"; }
+
+tool_data_dir() { # $1 tool, $2 worktree; prints the absolute dataDir, or nothing
+  local raw name
+  raw="$(jq -r --arg t "$1" '.tools[$t].dataDir // empty' <<<"$WT_CONFIG")"
+  [[ -n "$raw" ]] || return 0
+  name="$(basename "$2")"
+  echo "$2/${raw//\{name\}/$name}"
+}
+
+# Expand {name} {worktree} {mainRoot} {branch} {dataDir} in a template.
+tool_expand() { # $1 tool, $2 template, $3 worktree
+  local tool="$1" tpl="$2" wt="$3" name main_root branch data
+  name="$(basename "$wt")"
+  main_root="$(main_root_from "$wt")" || main_root=""
+  branch="$(git -C "$wt" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")"
+  data="$(tool_data_dir "$tool" "$wt")"
+  tpl="${tpl//\{name\}/$name}"
+  tpl="${tpl//\{worktree\}/$wt}"
+  tpl="${tpl//\{mainRoot\}/$main_root}"
+  tpl="${tpl//\{branch\}/$branch}"
+  tpl="${tpl//\{dataDir\}/$data}"
+  printf '%s' "$tpl"
+}
+
+tools_data_dirs() { # $1 worktree
+  local t d
+  while IFS= read -r t; do
+    [[ -n "$t" ]] || continue
+    d="$(tool_data_dir "$t" "$1")"
+    [[ -n "$d" ]] && echo "$d"
+  done < <(tool_names)
+  return 0
+}
+
+# Runs `setup` or `teardown` for every configured tool with that tool's env
+# exported. A tool whose `detect` binary is missing is skipped with a warning --
+# never a hard failure, so a worktree stays usable without every tool present.
+tools_run() { # $1 phase (setup|teardown), $2 worktree
+  local phase="$1" wt="$2" t detect cmd data k v
+  while IFS= read -r t; do
+    [[ -n "$t" ]] || continue
+    detect="$(jq -r --arg t "$t" '.tools[$t].detect // empty' <<<"$WT_CONFIG")"
+    if [[ -n "$detect" ]] && ! command -v "$detect" >/dev/null 2>&1; then
+      echo "  skip  tool '$t' ('$detect' not on PATH)"
+      continue
+    fi
+    data="$(tool_data_dir "$t" "$wt")"
+    [[ -n "$data" && "$phase" == "setup" ]] && mkdir -p "$data"
+
+    cmd="$(jq -r --arg t "$t" --arg p "$phase" '.tools[$t][$p] // empty' <<<"$WT_CONFIG")"
+    [[ -n "$cmd" ]] || continue
+    cmd="$(tool_expand "$t" "$cmd" "$wt")"
+
+    local -a envs=()
+    while IFS= read -r k; do
+      [[ -n "$k" ]] || continue
+      v="$(jq -r --arg t "$t" --arg k "$k" '.tools[$t].env[$k] // ""' <<<"$WT_CONFIG")"
+      envs+=("$k=$(tool_expand "$t" "$v" "$wt")")
+    done < <(jq -r --arg t "$t" '(.tools[$t].env // {}) | keys_unsorted[]' <<<"$WT_CONFIG")
+
+    echo "  tool  $t $phase"
+    if ! (cd "$wt" && env ${envs[@]+"${envs[@]}"} bash -c "$cmd"); then
+      echo "wt: warning: tool '$t' $phase failed" >&2
+    fi
+  done < <(tool_names)
+  return 0
+}
+
 bootstrap_dir() {
   local wt="$1"
   local main_root name f d
@@ -133,17 +202,8 @@ bootstrap_dir() {
     fi
   done < <(cfg_list '.npmInstallDirs')
 
-  if [[ "$(cfg '.tools.codegraph.enabled')" == "true" ]]; then
-    local data_dir="$wt/.codegraph-$name"
-    echo "  codegraph init/sync ($data_dir)"
-    if ! command -v codegraph >/dev/null 2>&1; then
-      echo "wt: warning: 'codegraph' not found on PATH — skipping index (see README Requirements)" >&2
-    elif ! (cd "$wt" && CODEGRAPH_PROJECT_PATH="$wt" CODEGRAPH_DATA_DIR="$data_dir" codegraph init -i && CODEGRAPH_PROJECT_PATH="$wt" CODEGRAPH_DATA_DIR="$data_dir" codegraph sync); then
-      echo "wt: warning: codegraph indexing failed" >&2
-    fi
-  else
-    echo "  skip  codegraph (disabled in config)"
-  fi
+  tools_run setup "$wt"
+
   echo "  bootstrap complete: $wt"
 }
 
@@ -339,7 +399,14 @@ config_defaults_json() {
   "pullRebase": true,
   "filesToLink": ["CLAUDE.local.md", ".claude/settings.local.json", ".env"],
   "npmInstallDirs": [".", "apps/frontend"],
-  "tools": { "codegraph": { "enabled": true } }
+  "tools": {
+    "codegraph": {
+      "detect": "codegraph",
+      "dataDir": ".codegraph-{name}",
+      "env": { "CODEGRAPH_PROJECT_PATH": "{worktree}", "CODEGRAPH_DATA_DIR": "{dataDir}" },
+      "setup": "codegraph init -i && codegraph sync"
+    }
+  }
 }
 JSON
 }
@@ -522,9 +589,16 @@ EOF
 
 clean_artifacts() {
   local wt="$1" f
-  if [[ "$(cfg '.tools.codegraph.enabled')" == "true" ]]; then
-    rm -rf "$wt/.codegraph-$(basename "$wt")" "$wt/.codegraph"
-  fi
+  local d
+  while IFS= read -r d; do
+    [[ -n "$d" ]] || continue
+    # dataDir is user-authored config: only ever delete inside the worktree, or
+    # a stray "../.." would turn clean into a delete-anything primitive
+    case "$d" in
+      "$wt"/*) rm -rf "$d" ;;
+      *) echo "wt: warning: refusing to remove a dataDir outside the worktree: $d" >&2 ;;
+    esac
+  done < <(tools_data_dirs "$wt")
   while IFS= read -r f; do
     [[ -n "$f" ]] || continue
     if [[ -L "$wt/$f" ]]; then
@@ -1015,6 +1089,50 @@ IGNORE
     && fail "config accepted removed field tools.*.enabled"
   grep -q "enabled" <<<"$out" || fail "error should name tools.*.enabled, got: $out"
   pass "config: removed fields are rejected with an actionable message"
+
+  # tools: env contract, detect gating, dataDir cleanup
+  cat > "$tmp/bin/faketool" <<STUB
+#!/usr/bin/env bash
+[[ -n "\$FAKE_ROOT" && -n "\$FAKE_DATA" ]] || exit 1
+mkdir -p "\$FAKE_DATA"
+echo "\$FAKE_ROOT" > "\$FAKE_DATA/root"
+STUB
+  chmod +x "$tmp/bin/faketool"
+
+  jq -n '{tools: {"!codegraph": true, faketool: {
+            detect: "faketool",
+            dataDir: ".fake-{name}",
+            env: {FAKE_ROOT: "{worktree}", FAKE_DATA: "{dataDir}"},
+            setup: "faketool"
+          }}}' > "$cfg"
+  out=$(w new review-pr-5678 2>&1) || fail "new with a custom tool: $out"
+  local fwt="$repo/.git-worktrees/review-pr-5678"
+  [[ -d "$fwt/.fake-review-pr-5678" ]] || fail "tool dataDir not created: $out"
+  [[ "$(cat "$fwt/.fake-review-pr-5678/root")" == "$fwt" ]] \
+    || fail "tool env {worktree} not expanded to the worktree path"
+
+  out=$(w clean review-pr-5678 2>&1) || fail "clean with a custom tool: $out"
+  [[ ! -e "$fwt/.fake-review-pr-5678" ]] || fail "clean did not remove the tool dataDir"
+  out=$(w teardown review-pr-5678 --force 2>&1) || fail "teardown after tool test: $out"
+
+  # detect gating: an absent binary skips the tool but still creates the worktree
+  jq -n '{tools: {"!codegraph": true, ghosttool: {detect: "definitely-not-installed", setup: "definitely-not-installed"}}}' > "$cfg"
+  out=$(w new review-pr-6789 2>&1) || fail "new must succeed when a tool binary is absent: $out"
+  [[ -d "$repo/.git-worktrees/review-pr-6789" ]] || fail "worktree not created with an absent tool"
+  grep -qi "skip" <<<"$out" || fail "absent tool should be reported as skipped, got: $out"
+  out=$(w teardown review-pr-6789 --force 2>&1) || fail "teardown after detect test: $out"
+
+  # a dataDir escaping the worktree must never be deleted
+  jq -n '{tools: {"!codegraph": true, escapee: {dataDir: "../../escape-{name}"}}}' > "$cfg"
+  out=$(w new review-pr-7890 2>&1) || fail "new with an escaping dataDir: $out"
+  mkdir -p "$repo/../escape-review-pr-7890" 2>/dev/null || true
+  out=$(w clean review-pr-7890 2>&1) || fail "clean with an escaping dataDir: $out"
+  [[ -d "$repo/../escape-review-pr-7890" ]] || fail "clean deleted a dataDir outside the worktree"
+  rm -rf "$repo/../escape-review-pr-7890"
+  out=$(w teardown review-pr-7890 --force 2>&1) || fail "teardown after escape test: $out"
+
+  rm -f "$cfg"
+  pass "tools: env contract, detect gating, dataDir cleanup, escape guard"
 
   echo "wt test: $passes groups passed"
 }
