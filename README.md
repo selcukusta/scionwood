@@ -166,17 +166,25 @@ Six keys. Everything optional — with no config at all, `wt new spike-auth` wor
 
 ```json
 {
-  "basePath":     ".git-worktrees",
+  "basePath": ".git-worktrees",
   "branchPrefix": "wt/",
-  "prRef":        "pull/{n}/head",
-  "filesToLink":  ["CLAUDE.local.md", ".claude/settings.local.json", ".env"],
-  "hooks":        { "postCreate": ".opencode/hooks/post-create.sh",
-                    "preTeardown": ".opencode/hooks/pre-teardown.sh" },
-  "tools":        { "codegraph": { "detect": "codegraph",
-                                   "dataDir": ".codegraph-{name}",
-                                   "env": { "CODEGRAPH_PROJECT_PATH": "{worktree}",
-                                            "CODEGRAPH_DATA_DIR": "{dataDir}" },
-                                   "setup": "codegraph init -i && codegraph sync" } }
+  "prRef": "pull/{n}/head",
+  "filesToLink": ["CLAUDE.local.md", ".claude/settings.local.json", ".env"],
+  "hooks": {
+    "postCreate": ".opencode/hooks/post-create.sh",
+    "preTeardown": ".opencode/hooks/pre-teardown.sh"
+  },
+  "tools": {
+    "codegraph": {
+      "detect": "codegraph",
+      "dataDir": ".codegraph-{name}",
+      "env": {
+        "CODEGRAPH_PROJECT_PATH": "{worktree}",
+        "CODEGRAPH_DATA_DIR": "{dataDir}"
+      },
+      "setup": "codegraph init -i && codegraph sync"
+    }
+  }
 }
 ```
 
@@ -210,13 +218,21 @@ file each layer came from.
 **Merge rules.** Maps merge by key, arrays union preserving order. A `!`-prefixed
 name removes something you inherited — an array entry or a map key:
 
+Your global config:
+
 ```json
-// global: { "filesToLink": ["CLAUDE.local.md", ".env"] }
-// repo:   { "filesToLink": [".env.test", "!.env"], "tools": { "!codegraph": true } }
-// result: filesToLink is [CLAUDE.local.md, .env.test], codegraph is gone
+{ "filesToLink": ["CLAUDE.local.md", ".env"] }
 ```
 
-So a repo can add a tool without redeclaring yours, and drop one it does not want.
+A repository's config:
+
+```json
+{ "filesToLink": [".env.test", "!.env"], "tools": { "!codegraph": true } }
+```
+
+Effective result: `filesToLink` is `["CLAUDE.local.md", ".env.test"]`, and the
+built-in `codegraph` tool is removed. So a repo can add to what you inherited,
+and drop what it does not want, without restating the rest.
 
 ## Environment overrides
 

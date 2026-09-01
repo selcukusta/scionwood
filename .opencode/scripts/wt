@@ -531,8 +531,7 @@ config_reject_removed() { # $1 human label for the layer, $2 json
   npmInstallDirs -> replaced by hooks.postCreate, a script you edit:
       wt init   (scaffolds .opencode/hooks/post-create.sh)
   tools.<name>.enabled -> remove the tool entry to disable it, or point
-      \"detect\" at a binary that is absent
-  See docs/migrating.md"
+      \"detect\" at a binary that is absent"
 }
 
 load_config() { # $1 main_root; idempotent
@@ -1342,6 +1341,27 @@ HOOK
 
   rm -f "$cfg"
   pass "teardown: wt's own symlinks are not uncommitted work, real changes still are"
+
+  # every ```json block in the shipped docs must be valid JSON. People copy-paste
+  # these; a block that does not parse is worse than one that is merely ugly.
+  local docroot docfile jsonblocks
+  docroot="$(cd "$(dirname "$self")/../.." && pwd -P)"
+  if [[ -f "$docroot/README.md" ]]; then
+    for docfile in "$docroot/README.md" "$docroot/docs/extending.md"; do
+      [[ -f "$docfile" ]] || continue
+      jsonblocks=0
+      while IFS= read -r block; do
+        [[ -n "$block" ]] || continue
+        jsonblocks=$((jsonblocks + 1))
+        printf '%s' "$block" | base64 -d | jq -e . >/dev/null 2>&1 \
+          || fail "invalid JSON in a \`\`\`json block of ${docfile#$docroot/} (block $jsonblocks)"
+      done < <(awk '/^```json$/{f=1;buf="";next} /^```$/{if(f){print buf|"base64";close("base64");f=0}} f{buf=buf $0 "\n"}' "$docfile")
+      [[ $jsonblocks -gt 0 ]] || fail "no json blocks found in ${docfile#$docroot/} — did the extractor break?"
+    done
+    pass "docs: every json block parses"
+  else
+    echo "  skip  docs json check (running outside a checkout)"
+  fi
 
   echo "wt test: $passes groups passed"
 }
