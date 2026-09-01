@@ -826,7 +826,15 @@ STUB
   mkdir -p "$tmp/repo/apps/frontend"
   echo '{}' > "$tmp/repo/package.json"
   echo '{}' > "$tmp/repo/apps/frontend/package.json"
-  git -C "$tmp/repo" add file.txt package.json apps/frontend/package.json
+  cat > "$tmp/repo/.gitignore" <<'IGNORE'
+.env
+CLAUDE.local.md
+.claude/
+node_modules/
+.codegraph-*
+.git-worktrees/
+IGNORE
+  git -C "$tmp/repo" add file.txt package.json apps/frontend/package.json .gitignore
   git -C "$tmp/repo" -c user.email=t@t -c user.name=t commit -qm init
 
   local default_branch
@@ -838,12 +846,32 @@ STUB
   git -C "$tmp/repo" push -q origin "$default_branch:refs/pull/2345/head"
   git -C "$tmp/repo" push -q origin "$default_branch:refs/pull/3456/head"
   git -C "$tmp/repo" push -q origin "$default_branch:refs/pull/4567/head"
+  git -C "$tmp/repo" push -q origin "$default_branch:refs/pull/5678/head"
+  git -C "$tmp/repo" push -q origin "$default_branch:refs/pull/6789/head"
+  git -C "$tmp/repo" push -q origin "$default_branch:refs/pull/7890/head"
+  git -C "$tmp/repo" push -q origin "$default_branch:refs/pull/8901/head"
+  git -C "$tmp/repo" push -q origin "$default_branch:refs/pull/9012/head"
 
   export PATH="$tmp/bin:$PATH"
   export WT_OPEN=none
   export WT_BIN="$tmp/bin"
   local repo
   repo="$(cd "$tmp/repo" && pwd -P)"
+
+  # a second repository, used to prove commands act on the repo you are standing in
+  mkdir -p "$tmp/repo2" "$tmp/remote2.git"
+  git -C "$tmp/remote2.git" init --bare -q
+  git -C "$tmp/repo2" init -q
+  echo two > "$tmp/repo2/file.txt"
+  git -C "$tmp/repo2" add file.txt
+  git -C "$tmp/repo2" -c user.email=t@t -c user.name=t commit -qm init
+  local default_branch2
+  default_branch2="$(git -C "$tmp/repo2" branch --show-current)"
+  git -C "$tmp/repo2" remote add origin "$tmp/remote2.git"
+  git -C "$tmp/repo2" push -q -u origin "$default_branch2"
+  git -C "$tmp/repo2" push -q origin "$default_branch2:refs/pull/1234/head"
+  local repo2
+  repo2="$(cd "$tmp/repo2" && pwd -P)"
   w() { (cd "$tmp/repo" && bash "$self" "$@"); }
 
   local out
