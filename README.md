@@ -82,7 +82,6 @@ Removes the codegraph data, symlinks, worktree, and branch — but only after ch
 | --- | --- |
 | `wt new <name> [--pr N \| --branch <ref> \| --from <ref>] [--no-open]` | Create `.git-worktrees/<name>`, bootstrap it, open opencode. With no source flag it branches from the repo's default branch. `wt new --pr N` auto-names the worktree `pr-N`. |
 | `wt config [--layers]` | Print the effective config, and where each layer came from. |
-| `wt trust` | Approve this repository's hooks and tool commands. |
 | `wt init [--force]` | Write `<repo>/.opencode/wt.json`. |
 | `wt list` | List open review worktrees and their branches. |
 | `wt open <name>` | Open opencode in an existing worktree. |
@@ -161,13 +160,6 @@ name removes something you inherited — an array entry or a map key:
 ```
 
 So a repo can add a tool without redeclaring yours, and drop one it does not want.
-
-### Commands in config need approval
-
-`hooks.*` and `tools.*.setup|teardown` execute shell commands, and a repo config
-arrives with a `git clone`. Run `wt trust` once per repository; editing a command
-re-arms the gate. Non-interactive sessions never prompt and never execute — they
-warn and carry on. See [docs/security.md](docs/security.md).
 
 ## Environment overrides
 

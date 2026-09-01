@@ -112,8 +112,12 @@ The rule for telling the two apart: a value containing whitespace is a command; 
 bare word that looks like a path (`.sh` suffix, or containing `/`) is a file, and
 a warning is printed if it is missing rather than handing your typo to the shell.
 
-A hook that fails warns; it never blocks the worktree. Hooks need `wt trust`
-once — see [security.md](security.md).
+A hook that fails warns; it never blocks the worktree.
+
+Note what this means: a repository's config can run commands on your machine when
+you create a worktree in it. `wt` prints every command as it runs, but it does not
+ask first — the same way `npm install` does not ask before running postinstall
+scripts. Read a config before working in a repository you do not know.
 
 ## 3. Support a different forge
 

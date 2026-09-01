@@ -73,14 +73,8 @@ npm install --no-fund --no-audit
 | — | `wt new theirs --branch feat-x` |
 | `wt install --defaults --non-interactive` | `wt install` (machine) then `wt init` (repo) |
 | — | `wt config [--layers]` |
-| — | `wt trust` |
 
-## Two things that will surprise you
-
-**Your repo config now needs approval.** `hooks` and `tools.*.setup|teardown`
-execute shell commands, and a config arrives with a `git clone`. Run `wt trust`
-once per repository. Editing a command re-arms the gate. See
-[security.md](security.md).
+## One thing that will surprise you
 
 **Teardown refuses to destroy work.** `wt teardown` now checks for uncommitted
 changes and unmerged commits and stops rather than discarding them. Pass

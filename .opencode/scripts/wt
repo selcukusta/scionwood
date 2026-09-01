@@ -37,8 +37,6 @@ usage:
                               machine setup, run once: writes the global wt
                               command and ~/.config/wt/config.json
   wt init [--force]           repository setup: writes <repo>/.opencode/wt.json
-  wt trust                    approve this repository's hooks and tool commands
-                              (recorded outside the repo; edits re-arm the gate)
   wt test                     run the built-in smoke tests (throwaway repo)
 
 env:
@@ -96,7 +94,6 @@ run_hook() { # $1 phase (postCreate|preTeardown), $2 worktree
   [[ -n "$spec" ]] || return 0
 
   main_root="$(main_root_from "$wt")" || main_root=""
-  [[ -n "$main_root" ]] && { commands_allowed "$main_root" || return 0; }
   name="$(basename "$wt")"
   branch="$(git -C "$wt" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")"
 
@@ -175,9 +172,6 @@ tools_data_dirs() { # $1 worktree
 # never a hard failure, so a worktree stays usable without every tool present.
 tools_run() { # $1 phase (setup|teardown), $2 worktree
   local phase="$1" wt="$2" t detect cmd data k v
-  local mr trusted=true
-  mr="$(main_root_from "$wt")" || mr=""
-  [[ -n "$mr" ]] && { commands_allowed "$mr" || trusted=false; }
   while IFS= read -r t; do
     [[ -n "$t" ]] || continue
     detect="$(jq -r --arg t "$t" '.tools[$t].detect // empty' <<<"$WT_CONFIG")"
@@ -190,12 +184,6 @@ tools_run() { # $1 phase (setup|teardown), $2 worktree
 
     cmd="$(jq -r --arg t "$t" --arg p "$phase" '.tools[$t][$p] // empty' <<<"$WT_CONFIG")"
     [[ -n "$cmd" ]] || continue
-    # env and dataDir are NOT gated: they set variables and make a directory
-    # inside the worktree. Only the command is withheld.
-    if ! $trusted; then
-      echo "  skip  tool '$t' $phase (repository not trusted; run 'wt trust')"
-      continue
-    fi
     cmd="$(tool_expand "$t" "$cmd" "$wt")"
 
     local -a envs=()
@@ -528,92 +516,6 @@ config_reject_removed() { # $1 human label for the layer, $2 json
   tools.<name>.enabled -> remove the tool entry to disable it, or point
       \"detect\" at a binary that is absent
   See docs/migrating.md"
-}
-
-trust_file() { echo "$(config_home)/wt/trust.json"; }
-
-# Hash only the fields that can execute something, from the REPO layer only.
-# The global layer is the user's own file and is never gated.
-repo_commands_digest() { # $1 main_root
-  # a tools value is not always an object -- "!name": true is a removal marker,
-  # and it executes nothing, so it contributes null to the digest
-  jq -S -c '{
-    hooks: (.hooks // {}),
-    tools: ((.tools // {}) | with_entries(.value |=
-      (if type == "object" then {setup: .setup, teardown: .teardown} else null end)))
-  }' <<<"$(config_read_file "$1/.opencode/wt.json")" | shasum -a 256 | awk '{print $1}'
-}
-
-repo_has_commands() { # $1 main_root; 0 if the repo layer carries any command
-  jq -e '
-    ((.hooks // {}) | to_entries | map(select(.value != null)) | length) > 0
-    or ((.tools // {}) | to_entries
-        | map(select((.value | type == "object") and (.value.setup != null or .value.teardown != null)))
-        | length) > 0
-  ' <<<"$(config_read_file "$1/.opencode/wt.json")" >/dev/null 2>&1
-}
-
-repo_is_trusted() { # $1 main_root
-  local tf digest recorded
-  tf="$(trust_file)"
-  [[ -f "$tf" ]] || return 1
-  digest="$(repo_commands_digest "$1")"
-  recorded="$(jq -r --arg r "$1" '.[$r] // empty' "$tf" 2>/dev/null || true)"
-  [[ -n "$recorded" && "$recorded" == "$digest" ]]
-}
-
-trust_record() { # $1 main_root
-  local tf digest
-  tf="$(trust_file)"
-  digest="$(repo_commands_digest "$1")"
-  mkdir -p "$(dirname "$tf")"
-  [[ -f "$tf" ]] || echo '{}' > "$tf"
-  jq --arg r "$1" --arg d "$digest" '.[$r] = $d' "$tf" > "$tf.tmp" && mv "$tf.tmp" "$tf"
-}
-
-# 0 when repo-provided commands may run. Fail-closed: a non-interactive session
-# never prompts and never executes. The decision is memoised so a single
-# invocation asks once, however many call sites consult it.
-_TRUST_DECISION=""
-commands_allowed() { # $1 main_root
-  local main_root="$1" ans
-  case "$_TRUST_DECISION" in
-    allow) return 0 ;;
-    deny)  return 1 ;;
-  esac
-  repo_has_commands "$main_root" || { _TRUST_DECISION=allow; return 0; }
-  repo_is_trusted "$main_root" && { _TRUST_DECISION=allow; return 0; }
-  if [[ ! -t 0 ]]; then
-    _TRUST_DECISION=deny
-    echo "wt: warning: skipping commands from $main_root/.opencode/wt.json (repository not trusted)" >&2
-    echo "wt: warning: review them, then run 'wt trust' in that repository" >&2
-    return 1
-  fi
-  echo "This repository's config wants to run commands:" >&2
-  jq -r '
-    ((.hooks // {}) | to_entries[] | "  hook  \(.key): \(.value)"),
-    ((.tools // {}) | to_entries[] | .key as $k | .value
-      | (if .setup    then "  tool  \($k) setup: \(.setup)"       else empty end),
-        (if .teardown then "  tool  \($k) teardown: \(.teardown)" else empty end))
-  ' <<<"$(config_read_file "$main_root/.opencode/wt.json")" >&2
-  read -rp "  run them for this repository? [y/N]: " ans
-  case "$ans" in
-    y|Y|yes|YES) trust_record "$main_root"; _TRUST_DECISION=allow; echo "  trusted: $main_root" >&2; return 0 ;;
-    *) _TRUST_DECISION=deny; echo "wt: warning: skipping repo-provided commands" >&2; return 1 ;;
-  esac
-}
-
-cmd_trust() {
-  local main_root
-  main_root="${WT_MAIN_ROOT:-$(main_root_from "$(pwd -P)")}" || die "could not locate the main repository"
-  require_jq
-  if ! repo_has_commands "$main_root"; then
-    echo "nothing to trust: $main_root/.opencode/wt.json declares no hooks or tool commands"
-    return 0
-  fi
-  trust_record "$main_root"
-  echo "trusted: $main_root"
-  echo "recorded in: $(trust_file)"
 }
 
 load_config() { # $1 main_root; idempotent
@@ -970,7 +872,7 @@ IGNORE
 
   export PATH="$tmp/bin:$PATH"
   export WT_OPEN=none
-  # never touch the real ~/.config: the suite writes global config and trust records
+  # never touch the real ~/.config: the suite writes a global config there
   export WT_CONFIG_HOME="$tmp/config"
   mkdir -p "$WT_CONFIG_HOME/wt"
   export WT_BIN="$tmp/bin"
@@ -1272,7 +1174,6 @@ STUB
             env: {FAKE_ROOT: "{worktree}", FAKE_DATA: "{dataDir}"},
             setup: "faketool"
           }}}' > "$cfg"
-  out=$(w trust 2>&1) || fail "trust for tool tests: $out"
   out=$(w new review-pr-5678 --pr 5678 2>&1) || fail "new with a custom tool: $out"
   local fwt="$repo/.git-worktrees/review-pr-5678"
   [[ -d "$fwt/.fake-review-pr-5678" ]] || fail "tool dataDir not created: $out"
@@ -1311,7 +1212,6 @@ printf '%s\n' "$WT_NAME" "$WT_ROOT" "$WT_MAIN_ROOT" "$WT_BRANCH" "$PWD" > .hook-
 HOOK
   chmod +x "$repo/.opencode/hooks/post-create.sh"
   jq -n '{tools:{"!codegraph":true}, hooks:{postCreate:".opencode/hooks/post-create.sh"}}' > "$cfg"
-  out=$(w trust 2>&1) || fail "trust for hook tests: $out"
 
   out=$(w new review-pr-8901 --pr 8901 2>&1) || fail "new with a file hook: $out"
   local hwt="$repo/.git-worktrees/review-pr-8901"
@@ -1324,7 +1224,6 @@ HOOK
   out=$(w teardown review-pr-8901 --force 2>&1) || fail "teardown after file-hook test: $out"
 
   jq -n '{tools:{"!codegraph":true}, hooks:{postCreate:"echo inline > .hook-inline"}}' > "$cfg"
-  out=$(w trust 2>&1) || fail "trust for inline-hook test: $out"
   out=$(w new review-pr-9012 --pr 9012 2>&1) || fail "new with an inline hook: $out"
   [[ "$(cat "$repo/.git-worktrees/review-pr-9012/.hook-inline")" == "inline" ]] || fail "inline hook did not run"
   out=$(w teardown review-pr-9012 --force 2>&1) || fail "teardown after inline-hook test: $out"
@@ -1337,7 +1236,6 @@ HOOK
 
   # preTeardown runs before the worktree is removed
   jq -n '{tools:{"!codegraph":true}, hooks:{preTeardown:"touch \"$WT_MAIN_ROOT/.pre-teardown-ran\""}}' > "$cfg"
-  out=$(w trust 2>&1) || fail "trust for preTeardown test: $out"
   rm -f "$repo/.pre-teardown-ran"
   out=$(w new review-pr-2468 --pr 2468 2>&1) || fail "new for preTeardown test: $out"
   out=$(w teardown review-pr-2468 --force 2>&1) || fail "teardown with preTeardown hook: $out"
@@ -1387,40 +1285,6 @@ HOOK
   rm -f "$cfg"
   pass "new: --pr / --branch / --from / default branch / --no-open"
 
-  # trust gate: repo-provided commands must not run untrusted
-  local tcfg="$tmp/trustcfg"
-  mkdir -p "$tcfg/wt"
-  jq -n '{tools:{"!codegraph":true}, hooks:{postCreate:"touch .untrusted-ran"}}' > "$cfg"
-  tw() { (cd "$tmp/repo" && WT_CONFIG_HOME="$tcfg" bash "$self" "$@"); }
-
-  out=$(tw new t-untrusted --no-open 2>&1) || fail "an untrusted repo must still create the worktree: $out"
-  [[ -d "$repo/.git-worktrees/t-untrusted" ]] || fail "untrusted repo blocked worktree creation"
-  [[ ! -e "$repo/.git-worktrees/t-untrusted/.untrusted-ran" ]] || fail "an untrusted repo hook was executed"
-  grep -qi "trust" <<<"$out" || fail "skipping untrusted commands should mention 'wt trust', got: $out"
-  out=$(tw teardown t-untrusted --force 2>&1) || fail "teardown after untrusted test: $out"
-
-  out=$(tw trust 2>&1) || fail "wt trust: $out"
-  [[ -f "$tcfg/wt/trust.json" ]] || fail "wt trust did not record anything"
-
-  out=$(tw new t-trusted --no-open 2>&1) || fail "new after trusting: $out"
-  [[ -e "$repo/.git-worktrees/t-trusted/.untrusted-ran" ]] || fail "a trusted repo hook did not run"
-  out=$(tw teardown t-trusted --force 2>&1) || fail "teardown after trusted test: $out"
-
-  # changing the command re-arms the gate
-  jq -n '{tools:{"!codegraph":true}, hooks:{postCreate:"touch .changed-ran"}}' > "$cfg"
-  out=$(tw new t-changed --no-open 2>&1) || fail "new after changing the hook: $out"
-  [[ ! -e "$repo/.git-worktrees/t-changed/.changed-ran" ]] || fail "a changed command ran without re-approval"
-  out=$(tw teardown t-changed --force 2>&1) || fail "teardown after change test: $out"
-
-  # a config with no commands is never gated
-  jq -n '{tools:{"!codegraph":true}, basePath:".git-worktrees"}' > "$cfg"
-  out=$(tw new t-nocmds --no-open 2>&1) || fail "a command-free config must not be gated: $out"
-  grep -qi "not trusted" <<<"$out" && fail "a command-free config should not mention trust: $out"
-  out=$(tw teardown t-nocmds --force 2>&1) || fail "teardown after no-commands test: $out"
-
-  rm -f "$cfg"
-  pass "trust: repo-provided commands do not run until approved, changes re-arm"
-
   echo "wt test: $passes groups passed"
 }
 
@@ -1429,7 +1293,6 @@ case "${1:-}" in
   list) shift; cmd_list "$@" ;;
   config) shift; cmd_config "$@" ;;
   init) shift; cmd_init "$@" ;;
-  trust) shift; cmd_trust "$@" ;;
   open) shift; cmd_open "$@" ;;
   install) shift; cmd_install "$@" ;;
   bootstrap) shift; cmd_bootstrap "$@" ;;
