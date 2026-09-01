@@ -572,12 +572,19 @@ trust_record() { # $1 main_root
 }
 
 # 0 when repo-provided commands may run. Fail-closed: a non-interactive session
-# never prompts and never executes.
+# never prompts and never executes. The decision is memoised so a single
+# invocation asks once, however many call sites consult it.
+_TRUST_DECISION=""
 commands_allowed() { # $1 main_root
   local main_root="$1" ans
-  repo_has_commands "$main_root" || return 0
-  repo_is_trusted "$main_root" && return 0
+  case "$_TRUST_DECISION" in
+    allow) return 0 ;;
+    deny)  return 1 ;;
+  esac
+  repo_has_commands "$main_root" || { _TRUST_DECISION=allow; return 0; }
+  repo_is_trusted "$main_root" && { _TRUST_DECISION=allow; return 0; }
   if [[ ! -t 0 ]]; then
+    _TRUST_DECISION=deny
     echo "wt: warning: skipping commands from $main_root/.opencode/wt.json (repository not trusted)" >&2
     echo "wt: warning: review them, then run 'wt trust' in that repository" >&2
     return 1
@@ -591,8 +598,8 @@ commands_allowed() { # $1 main_root
   ' <<<"$(config_read_file "$main_root/.opencode/wt.json")" >&2
   read -rp "  run them for this repository? [y/N]: " ans
   case "$ans" in
-    y|Y|yes|YES) trust_record "$main_root"; echo "  trusted: $main_root" >&2; return 0 ;;
-    *) echo "wt: warning: skipping repo-provided commands" >&2; return 1 ;;
+    y|Y|yes|YES) trust_record "$main_root"; _TRUST_DECISION=allow; echo "  trusted: $main_root" >&2; return 0 ;;
+    *) _TRUST_DECISION=deny; echo "wt: warning: skipping repo-provided commands" >&2; return 1 ;;
   esac
 }
 
