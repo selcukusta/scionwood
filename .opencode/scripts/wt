@@ -1,15 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# install-config defaults (schema for .opencode/wt.json)
+# Effective config as JSON, resolved by load_config from four layers:
+#   built-in defaults < ~/.config/wt/config.json < <repo>/.opencode/wt.json < WT_*
+WT_CONFIG=""
+# CFG_BASE_PATH stays a plain global: main_root_from reads it before any config
+# has been loaded, so it must always hold a usable value.
 CFG_BASE_PATH=".git-worktrees"
-CFG_BRANCH_PREFIX="review/"
-CFG_NAME_PATTERN="^review-pr-([0-9]+)$"
-CFG_FETCH_PRUNE=true
-CFG_PULL_REBASE=true
-CFG_FILES_TO_LINK=("CLAUDE.local.md" ".claude/settings.local.json" ".env")
-CFG_NPM_DIRS=("." "apps/frontend")
-CFG_CODEGRAPH=true
 _CFG_LOADED=false
 
 usage() {
@@ -19,6 +16,9 @@ usage:
                               <name> must match the configured name pattern (default
                               'review-pr-1234'); the PR head is fetched from origin
   wt list                     list review worktrees and their branches
+  wt config [--layers]        print the effective config; --layers also shows
+                              which file each layer came from
+  wt init [--force]           write <repo>/.opencode/wt.json
   wt open <name>              open opencode in an existing review worktree
   wt bootstrap [name|path]    (re)create ignored-file symlinks + npm install
                               (configured dirs) + codegraph index
@@ -109,7 +109,8 @@ bootstrap_dir() {
   load_config "$main_root"
   name="$(basename "$wt")"
 
-  for f in ${CFG_FILES_TO_LINK[@]+"${CFG_FILES_TO_LINK[@]}"}; do
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
     if [[ ! -e "$main_root/$f" ]]; then
       echo "  skip  $f (not in main repo)"
       continue
@@ -121,17 +122,18 @@ bootstrap_dir() {
     mkdir -p "$(dirname "$wt/$f")"
     ln -sfn "$main_root/$f" "$wt/$f"
     echo "  link  $f -> $main_root/$f"
-  done
+  done < <(cfg_list '.filesToLink')
 
-  for d in ${CFG_NPM_DIRS[@]+"${CFG_NPM_DIRS[@]}"}; do
+  while IFS= read -r d; do
+    [[ -n "$d" ]] || continue
     if [[ "$d" == "." ]]; then
       npm_install_dir "$wt"
     else
       npm_install_dir "$wt/$d"
     fi
-  done
+  done < <(cfg_list '.npmInstallDirs')
 
-  if [[ "$CFG_CODEGRAPH" == "true" ]]; then
+  if [[ "$(cfg '.tools.codegraph.enabled')" == "true" ]]; then
     local data_dir="$wt/.codegraph-$name"
     echo "  codegraph init/sync ($data_dir)"
     if ! command -v codegraph >/dev/null 2>&1; then
@@ -203,11 +205,13 @@ cmd_new() {
   main_root="$(main_root_from "$(pwd -P)")" || die "could not locate the main repository (run from inside the repo, or set WT_MAIN_ROOT)"
   load_config "$main_root"
 
-  if [[ ! "$name" =~ $CFG_NAME_PATTERN ]]; then
-    die "worktree name must match '$CFG_NAME_PATTERN', got: $name"
+  local name_pattern
+  name_pattern="$(cfg '.namePattern')"
+  if [[ ! "$name" =~ $name_pattern ]]; then
+    die "worktree name must match '$name_pattern', got: $name"
   fi
   local pr_number="${BASH_REMATCH[1]}"
-  local local_branch="${CFG_BRANCH_PREFIX}${name}"
+  local local_branch="$(cfg '.branchPrefix')${name}"
 
   local wt
   wt="$main_root/$CFG_BASE_PATH/$name"
@@ -216,13 +220,13 @@ cmd_new() {
   fi
   mkdir -p "$main_root/$CFG_BASE_PATH"
 
-  if [[ "$CFG_FETCH_PRUNE" == "true" ]]; then
+  if [[ "$(cfg '.fetchPrune')" == "true" ]]; then
     git -C "$main_root" fetch --prune
   else
     echo "  skipping fetch --prune (per config)"
   fi
 
-  if [[ "$CFG_PULL_REBASE" == "true" ]]; then
+  if [[ "$(cfg '.pullRebase')" == "true" ]]; then
     if ! git -C "$main_root" pull --rebase; then
       echo "wt: warning: 'git pull --rebase' failed (no upstream?); continuing" >&2
     fi
@@ -241,7 +245,9 @@ cmd_new() {
 }
 
 cmd_bootstrap() {
-  local wt
+  local wt mr
+  mr="$(main_root_from "$(pwd -P)")" || die "could not locate the main repository"
+  load_config "$mr"
   wt="$(resolve_worktree_target "${1:-}" | tail -1)"
   bootstrap_dir "$wt"
 }
@@ -312,419 +318,153 @@ config_merge() {
   '
 }
 
-cfg_get() { # $1 cfg file, $2 jq expr (with // fallback), $3 shell fallback
-  local v
-  v="$(jq -r "$2 | tostring" "$1" 2>/dev/null)" || { echo "$3"; return 0; }
-  [[ "$v" == "null" ]] && echo "$3" || echo "$v"
+config_home() {
+  echo "${WT_CONFIG_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}}"
 }
 
-# NOTE: for booleans do NOT pass '// true' as the jq expr — jq's // treats
-# 'false' as falsy and would coerce false back to true. Rely on cfg_get's
-# null/error handling instead (missing key -> shell fallback).
+global_config_path() { echo "$(config_home)/wt/config.json"; }
 
-config_set_defaults() {
-  CFG_BASE_PATH=".git-worktrees"
-  CFG_BRANCH_PREFIX="review/"
-  CFG_NAME_PATTERN="^review-pr-([0-9]+)$"
-  CFG_FETCH_PRUNE=true
-  CFG_PULL_REBASE=true
-  CFG_FILES_TO_LINK=("CLAUDE.local.md" ".claude/settings.local.json" ".env")
-  CFG_NPM_DIRS=("." "apps/frontend")
-  CFG_CODEGRAPH=true
+config_defaults_json() {
+  cat <<'JSON'
+{
+  "basePath": ".git-worktrees",
+  "branchPrefix": "review/",
+  "namePattern": "^review-pr-([0-9]+)$",
+  "fetchPrune": true,
+  "pullRebase": true,
+  "filesToLink": ["CLAUDE.local.md", ".claude/settings.local.json", ".env"],
+  "npmInstallDirs": [".", "apps/frontend"],
+  "tools": { "codegraph": { "enabled": true } }
+}
+JSON
 }
 
-config_load() { # $1 cfg file; populates CFG_* globals from existing config
-  local cfg="$1" v
-  CFG_BASE_PATH="$(cfg_get "$cfg" '.basePath // ".git-worktrees"' '.git-worktrees')"
-  CFG_BRANCH_PREFIX="$(cfg_get "$cfg" '.branchPrefix // "review/"' 'review/')"
-  CFG_NAME_PATTERN="$(cfg_get "$cfg" '.namePattern // "^review-pr-([0-9]+)$"' '^review-pr-([0-9]+)$')"
-  CFG_FETCH_PRUNE="$(parse_bool "$(cfg_get "$cfg" '.fetchPrune' true)" "config fetchPrune")"
-  CFG_PULL_REBASE="$(parse_bool "$(cfg_get "$cfg" '.pullRebase' true)" "config pullRebase")"
-  CFG_CODEGRAPH="$(parse_bool "$(cfg_get "$cfg" '.tools.codegraph.enabled' true)" "config tools.codegraph.enabled")"
-  CFG_FILES_TO_LINK=()
-  if jq -e '.filesToLink == null' "$cfg" >/dev/null 2>&1; then
-    CFG_FILES_TO_LINK=("CLAUDE.local.md" ".claude/settings.local.json" ".env")
-  elif jq -e '.filesToLink | type == "array" and (all(type == "string"))' "$cfg" >/dev/null 2>&1; then
-    while IFS= read -r v; do CFG_FILES_TO_LINK+=("$v"); done < <(jq -r '.filesToLink[]' "$cfg")
-  else
-    die "config: filesToLink must be a JSON array of strings (got $(jq -c '.filesToLink' "$cfg")). Edit $cfg and use e.g. [\"CLAUDE.local.md\", \".claude/settings.local.json\", \".env\"]."
+# Build the env layer from WT_* variables. An absent variable contributes
+# nothing, so it can never clobber a lower layer with null.
+config_env_json() {
+  local j='{}'
+  [[ -n "${WT_BASE:-}" ]]          && j="$(jq -c --arg v "$WT_BASE" '.basePath=$v' <<<"$j")"
+  [[ -n "${WT_BRANCH_PREFIX:-}" ]] && j="$(jq -c --arg v "$WT_BRANCH_PREFIX" '.branchPrefix=$v' <<<"$j")"
+  [[ -n "${WT_NAME_PATTERN:-}" ]]  && j="$(jq -c --arg v "$WT_NAME_PATTERN" '.namePattern=$v' <<<"$j")"
+  [[ -n "${WT_PR_REF:-}" ]]        && j="$(jq -c --arg v "$WT_PR_REF" '.prRef=$v' <<<"$j")"
+  if [[ -n "${WT_FILES_TO_LINK:-}" ]]; then
+    j="$(jq -c --arg v "$WT_FILES_TO_LINK" \
+      '.filesToLink = ($v | split(",") | map(gsub("^\\s+|\\s+$";"")) | map(select(length>0)))' <<<"$j")"
   fi
-  CFG_NPM_DIRS=()
-  if jq -e '.npmInstallDirs == null' "$cfg" >/dev/null 2>&1; then
-    CFG_NPM_DIRS=("." "apps/frontend")
-  elif jq -e '.npmInstallDirs | type == "array" and (all(type == "string"))' "$cfg" >/dev/null 2>&1; then
-    while IFS= read -r v; do CFG_NPM_DIRS+=("$v"); done < <(jq -r '.npmInstallDirs[]' "$cfg")
-  else
-    die "config: npmInstallDirs must be a JSON array of strings (got $(jq -c '.npmInstallDirs' "$cfg")). Edit $cfg and use e.g. [\".\", \"apps/frontend\"]."
-  fi
+  echo "$j"
 }
 
-config_write() { # $1 cfg file; atomically writes CFG_* globals as JSON
-  local cfg="$1" files_json npm_json tools_json json
-  if [[ ${#CFG_FILES_TO_LINK[@]} -eq 0 ]]; then
-    files_json='[]'
-  else
-    files_json="$(printf '%s\n' "${CFG_FILES_TO_LINK[@]}" | jq -R . | jq -s -c .)"
+config_read_file() { # $1 path; prints its JSON or {} -- never a partial read
+  local f="$1"
+  [[ -f "$f" ]] || { echo '{}'; return 0; }
+  if ! jq -e . "$f" >/dev/null 2>&1; then
+    die "config is not valid JSON: $f"
   fi
-  if [[ ${#CFG_NPM_DIRS[@]} -eq 0 ]]; then
-    npm_json='[]'
-  else
-    npm_json="$(printf '%s\n' "${CFG_NPM_DIRS[@]}" | jq -R . | jq -s -c .)"
-  fi
-  tools_json="$(jq -nc --argjson e "$CFG_CODEGRAPH" '{codegraph: {enabled: $e}}')"
-  json="$(jq -n \
-    --arg basePath "$CFG_BASE_PATH" \
-    --arg branchPrefix "$CFG_BRANCH_PREFIX" \
-    --arg namePattern "$CFG_NAME_PATTERN" \
-    --argjson fetchPrune "$CFG_FETCH_PRUNE" \
-    --argjson pullRebase "$CFG_PULL_REBASE" \
-    --argjson filesToLink "$files_json" \
-    --argjson npmInstallDirs "$npm_json" \
-    --argjson tools "$tools_json" \
-    '{basePath: $basePath, branchPrefix: $branchPrefix, namePattern: $namePattern, fetchPrune: $fetchPrune, pullRebase: $pullRebase, filesToLink: $filesToLink, npmInstallDirs: $npmInstallDirs, tools: $tools}')"
-  mkdir -p "$(dirname "$cfg")"
-  printf '%s\n' "$json" > "$cfg.tmp"
-  mv "$cfg.tmp" "$cfg"
+  jq -c . "$f"
 }
 
-parse_bool() { # $1 value, $2 context; echoes true/false, dies on invalid
-  local v
-  v="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
-  case "$v" in
-    true|yes|1) echo true ;;
-    false|no|0) echo false ;;
-    *) die "invalid boolean for $2: '$1' (expected true/false/yes/no/1/0)" ;;
-  esac
-}
-
-trim() { # $1 string; prints with leading/trailing whitespace removed
-  local s="$1"
-  s="${s#"${s%%[![:space:]]*}"}"
-  s="${s%"${s##*[![:space:]]}"}"
-  printf '%s' "$s"
-}
-
-csv_items() { # $1 comma-separated; prints trimmed non-empty items, one per line
-  local csv="$1" item
-  local -a parts=()
-  local old_ifs="$IFS"
-  IFS=,
-  read -ra parts <<< "$csv"
-  IFS="$old_ifs"
-  for item in ${parts[@]+"${parts[@]}"}; do
-    item="$(trim "$item")"
-    [[ -n "$item" ]] && echo "$item"
-  done
-  return 0
-}
-
-load_config() { # $1 main_root; idempotent: config file -> schema defaults -> env overrides
-  local main_root="$1" cfg
-  if $_CFG_LOADED; then
-    return 0
-  fi
-  cfg="$main_root/.opencode/wt.json"
-  if [[ -f "$cfg" ]]; then
-    if jq -e . "$cfg" >/dev/null 2>&1; then
-      config_load "$cfg"
-    else
-      echo "wt: warning: ignoring invalid config $cfg (using defaults)" >&2
-    fi
-  fi
-  apply_env_overrides
+load_config() { # $1 main_root; idempotent
+  local main_root="$1" g_json r_json
+  $_CFG_LOADED && return 0
+  require_jq
+  g_json="$(config_read_file "$(global_config_path)")"
+  r_json="$(config_read_file "$main_root/.opencode/wt.json")"
+  WT_CONFIG="$(printf '%s\n%s\n%s\n%s\n' \
+    "$(config_defaults_json | jq -c .)" "$g_json" "$r_json" "$(config_env_json)" | config_merge)"
+  CFG_BASE_PATH="$(cfg '.basePath')"
   _CFG_LOADED=true
 }
 
-apply_env_overrides() { # WT_* env vars (validated) override CFG_*
-  if [[ -n "${WT_BASE:-}" ]]; then
-    CFG_BASE_PATH="$WT_BASE"
-  fi
-  if [[ -n "${WT_BRANCH_PREFIX:-}" ]]; then
-    CFG_BRANCH_PREFIX="$WT_BRANCH_PREFIX"
-  fi
-  if [[ -n "${WT_NAME_PATTERN:-}" ]]; then
-    CFG_NAME_PATTERN="$WT_NAME_PATTERN"
-  fi
-  if [[ -n "${WT_FETCH_PRUNE:-}" ]]; then
-    CFG_FETCH_PRUNE="$(parse_bool "$WT_FETCH_PRUNE" "WT_FETCH_PRUNE")"
-  fi
-  if [[ -n "${WT_PULL_REBASE:-}" ]]; then
-    CFG_PULL_REBASE="$(parse_bool "$WT_PULL_REBASE" "WT_PULL_REBASE")"
-  fi
-  if [[ -n "${WT_FILES_TO_LINK:-}" ]]; then
-    local wt_files
-    wt_files="$(csv_items "$WT_FILES_TO_LINK")"
-    if [[ -n "$wt_files" ]]; then
-      CFG_FILES_TO_LINK=()
-      while IFS= read -r f; do CFG_FILES_TO_LINK+=("$f"); done <<< "$wt_files"
-    else
-      echo "wt: warning: WT_FILES_TO_LINK='$WT_FILES_TO_LINK' parsed to no items (expected comma-separated names); keeping config value" >&2
-    fi
-  fi
-  if [[ -n "${WT_NPM_DIRS:-}" ]]; then
-    local wt_dirs
-    wt_dirs="$(csv_items "$WT_NPM_DIRS")"
-    if [[ -n "$wt_dirs" ]]; then
-      CFG_NPM_DIRS=()
-      while IFS= read -r d; do CFG_NPM_DIRS+=("$d"); done <<< "$wt_dirs"
-    else
-      echo "wt: warning: WT_NPM_DIRS='$WT_NPM_DIRS' parsed to no items (expected comma-separated dirs); keeping config value" >&2
-    fi
-  fi
-  if [[ -n "${WT_CODEGRAPH:-}" ]]; then
-    CFG_CODEGRAPH="$(parse_bool "$WT_CODEGRAPH" "WT_CODEGRAPH")"
-  fi
+cfg() {      # $1 jq expression; prints the scalar value
+  jq -r "$1 // empty" <<<"$WT_CONFIG"
 }
 
-prompt_bool() { # $1 label, $2 default (true/false)
-  local label="$1" default="$2" disp val
-  if [[ "$default" == "true" ]]; then disp="Y"; else disp="N"; fi
-  while true; do
-    read -rp "  $label [$disp]: " val
-    val="${val:-$disp}"
-    case "$val" in
-      y|Y|yes|YES|true) echo true; return 0 ;;
-      n|N|no|NO|false) echo false; return 0 ;;
-      *) echo "  (answer y or n)" >&2 ;;
-    esac
-  done
+cfg_list() { # $1 jq expression selecting an array; prints one element per line
+  jq -r "($1 // []) | .[]" <<<"$WT_CONFIG"
 }
 
-multi_pick() { # $1 title, $2 default selection, rest: items
-  # prints the numbered list to stderr, selected items to stdout
-  local title="$1" default="$2"; shift 2
-  local -a items=("$@")
-  local i sel tok from to m dup
-  echo "  $title:" >&2
-  for i in "${!items[@]}"; do
-    echo "    $((i+1)). ${items[$i]}" >&2
-  done
-  read -rp "  choose (e.g. 1,3 / 1-3 / all / none) [${default:-none}]: " sel
-  sel="${sel:-$default}"
-  sel="${sel//,/ }"
-  if [[ "$sel" == "all" ]]; then
-    for i in "${!items[@]}"; do echo "${items[$i]}"; done
-    return 0
-  fi
-  if [[ -z "$sel" || "$sel" == "none" ]]; then
-    return 0
-  fi
-  local -a picked=() tokens=()
-  read -ra tokens <<< "$sel"
-  for tok in ${tokens[@]+"${tokens[@]}"}; do
-    if [[ "$tok" == *-* ]]; then
-      from="${tok%%-*}"; to="${tok##*-}"
-      if [[ "$from" =~ ^[0-9]+$ && "$to" =~ ^[0-9]+$ ]]; then
-        for ((i=from; i<=to; i++)); do
-          dup=0
-          for m in ${picked[@]+"${picked[@]}"}; do [[ "$m" == "$i" ]] && dup=1; done
-          [[ $dup -eq 0 ]] && picked+=("$i")
-        done
-      fi
-    elif [[ "$tok" =~ ^[0-9]+$ ]]; then
-      dup=0
-      for m in ${picked[@]+"${picked[@]}"}; do [[ "$m" == "$tok" ]] && dup=1; done
-      [[ $dup -eq 0 ]] && picked+=("$tok")
-    fi
-  done
-  for tok in ${picked[@]+"${picked[@]}"}; do
-    i=$((tok - 1))
-    if [[ $i -ge 0 && $i -lt ${#items[@]} ]]; then
-      echo "${items[$i]}"
-    fi
-  done
-  return 0
-}
-
-install_config() { # $1 main_root, $2 cfg, $3 reset, $4 non_interactive, $5 defaults
-  local main_root="$1" cfg="$2" reset="$3" non_interactive="$4" defaults="$5"
-  local existing="{}" val rc caps
-
-  if $reset; then
-    existing="{}"
-  elif [[ -f "$cfg" ]]; then
-    if jq -e . "$cfg" >/dev/null 2>&1; then
-      existing="$(cat "$cfg")"
-    else
-      die "existing config is not valid JSON: $cfg (use --reset to overwrite)"
-    fi
-  fi
-
-  if $non_interactive; then
-    if $defaults; then
-      config_set_defaults
-    else
-      if [[ ! -f "$cfg" ]]; then
-        die "no config found at $cfg (run 'wt install' interactively, or use --defaults --non-interactive)"
-      fi
-      config_load "$cfg"
-    fi
-    config_write "$cfg"
-    return 0
-  fi
-
-  # interactive: seed from existing config, else schema defaults
-  if [[ "$existing" != "{}" ]]; then
-    config_load "$cfg"
-  else
-    config_set_defaults
-  fi
-
-  echo "writing config: $cfg (Ctrl-C to abort)"
-
-  while true; do
-    read -rp "  basePath [${CFG_BASE_PATH}]: " val
-    val="${val:-$CFG_BASE_PATH}"
-    if [[ "$val" == /* || "$val" == *..* ]]; then
-      echo "  (invalid: must be a relative path without '..')" >&2
-      continue
-    fi
-    CFG_BASE_PATH="$val"
-    break
-  done
-
-  read -rp "  branchPrefix [${CFG_BRANCH_PREFIX}]: " val
-  CFG_BRANCH_PREFIX="${val:-$CFG_BRANCH_PREFIX}"
-
-  while true; do
-    read -rp "  namePattern [${CFG_NAME_PATTERN}]: " val
-    val="${val:-$CFG_NAME_PATTERN}"
-    rc=0
-    grep -qE "$val" <<<"" 2>/dev/null || rc=$?
-    if [[ $rc -eq 2 ]]; then
-      echo "  (invalid: not a valid regular expression)" >&2
-      continue
-    fi
-    caps="$(printf '%s' "$val" | sed 's/\\[()]/x/g' | grep -o '(' | wc -l | tr -d ' ')"
-    if [[ "$caps" != "1" ]]; then
-      echo "  (invalid: must contain exactly one capture group '(...)')" >&2
-      continue
-    fi
-    CFG_NAME_PATTERN="$val"
-    break
-  done
-
-  CFG_FETCH_PRUNE="$(prompt_bool "fetchPrune" "$CFG_FETCH_PRUNE")"
-  CFG_PULL_REBASE="$(prompt_bool "pullRebase" "$CFG_PULL_REBASE")"
-
-  # filesToLink: pre-detect existing files
-  local -a file_items=() picked=()
-  local f d i have c
-  for f in "CLAUDE.local.md" ".claude/settings.local.json" ".env"; do
-    [[ -e "$main_root/$f" ]] && file_items+=("$f")
-  done
-  for d in "$main_root"/apps/*/; do
-    [[ -d "$d" ]] || continue
-    [[ -e "$d/.env" ]] && file_items+=("apps/$(basename "$d")/.env")
-  done
-  for d in "$main_root"/packages/*/; do
-    [[ -d "$d" ]] || continue
-    [[ -e "$d/.env.local" ]] && file_items+=("packages/$(basename "$d")/.env.local")
-  done
-  for f in ${CFG_FILES_TO_LINK[@]+"${CFG_FILES_TO_LINK[@]}"}; do
-    have=0
-    for c in ${file_items[@]+"${file_items[@]}"}; do [[ "$c" == "$f" ]] && have=1; done
-    [[ $have -eq 0 ]] && file_items+=("$f")
-  done
-  local def=""
-  for f in ${CFG_FILES_TO_LINK[@]+"${CFG_FILES_TO_LINK[@]}"}; do
-    for i in "${!file_items[@]}"; do
-      if [[ "${file_items[$i]}" == "$f" ]]; then
-        [[ -n "$def" ]] && def="$def,"
-        def="$def$((i+1))"
-        break
-      fi
-    done
-  done
-  picked=()
-  while IFS= read -r v; do picked+=("$v"); done < <(multi_pick "filesToLink (detected files in repo)" "$def" ${file_items[@]+"${file_items[@]}"})
-  CFG_FILES_TO_LINK=("${picked[@]+"${picked[@]}"}")
-
-  # npmInstallDirs: pre-detect dirs with package.json
-  local -a npm_items=()
-  [[ -f "$main_root/package.json" ]] && npm_items+=(".")
-  for d in "$main_root"/apps/*/; do
-    [[ -d "$d" ]] || continue
-    [[ -f "$d/package.json" ]] && npm_items+=("apps/$(basename "$d")")
-  done
-  for d in "$main_root"/packages/*/; do
-    [[ -d "$d" ]] || continue
-    [[ -f "$d/package.json" ]] && npm_items+=("packages/$(basename "$d")")
-  done
-  for f in ${CFG_NPM_DIRS[@]+"${CFG_NPM_DIRS[@]}"}; do
-    have=0
-    for c in ${npm_items[@]+"${npm_items[@]}"}; do [[ "$c" == "$f" ]] && have=1; done
-    [[ $have -eq 0 ]] && npm_items+=("$f")
-  done
-  def=""
-  for f in ${CFG_NPM_DIRS[@]+"${CFG_NPM_DIRS[@]}"}; do
-    for i in "${!npm_items[@]}"; do
-      if [[ "${npm_items[$i]}" == "$f" ]]; then
-        [[ -n "$def" ]] && def="$def,"
-        def="$def$((i+1))"
-        break
-      fi
-    done
-  done
-  picked=()
-  while IFS= read -r v; do picked+=("$v"); done < <(multi_pick "npmInstallDirs (dirs with package.json)" "$def" ${npm_items[@]+"${npm_items[@]}"})
-  CFG_NPM_DIRS=("${picked[@]+"${picked[@]}"}")
-
-  CFG_CODEGRAPH="$(prompt_bool "tools.codegraph.enabled" "$CFG_CODEGRAPH")"
-
-  config_write "$cfg"
-  echo "config written: $cfg"
-}
-
-cmd_install() {
-  local reset=false non_interactive=false defaults=false cfg_arg=""
+cmd_config() {
+  local show_layers=false
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --reset) reset=true; shift ;;
-      --non-interactive) non_interactive=true; shift ;;
-      --defaults) defaults=true; shift ;;
-      --config)
-        [[ $# -ge 2 ]] || die "option --config requires a path"
-        cfg_arg="$2"; shift 2 ;;
-      --config=*) cfg_arg="${1#--config=}"; shift ;;
+      --layers) show_layers=true; shift ;;
+      *) die "unknown option for config: $1 (see --help)" ;;
+    esac
+  done
+  local main_root
+  main_root="${WT_MAIN_ROOT:-$(main_root_from "$(pwd -P)")}" || die "could not locate the main repository"
+  load_config "$main_root"
+  if $show_layers; then
+    local g r
+    g="$(global_config_path)"; r="$main_root/.opencode/wt.json"
+    echo "layers, lowest precedence first:"
+    echo "  1. defaults        (built in)"
+    echo "  2. $g$([[ -f "$g" ]] || echo '   (absent)')"
+    echo "  3. $r$([[ -f "$r" ]] || echo '   (absent)')"
+    echo "  4. WT_* env vars$([[ "$(config_env_json)" == '{}' ]] && echo '   (none set)')"
+    echo
+  fi
+  jq . <<<"$WT_CONFIG"
+}
+
+cmd_init() {
+  local force=false
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --force) force=true; shift ;;
+      *) die "unknown option for init: $1 (see --help)" ;;
+    esac
+  done
+  require_jq
+  local main_root cfg_path hooks
+  main_root="${WT_MAIN_ROOT:-$(main_root_from "$(pwd -P)")}" || die "could not locate the main repository"
+  cfg_path="$main_root/.opencode/wt.json"
+  hooks="$main_root/.opencode/hooks"
+  if [[ -f "$cfg_path" ]] && ! $force; then
+    die "config already exists: $cfg_path (use --force to overwrite)"
+  fi
+  mkdir -p "$(dirname "$cfg_path")" "$hooks"
+  config_defaults_json > "$cfg_path.tmp" && mv "$cfg_path.tmp" "$cfg_path"
+  echo "config written:  $cfg_path"
+}
+
+
+cmd_install() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --config-home) [[ $# -ge 2 ]] || die "option --config-home requires a path"
+                     WT_CONFIG_HOME="$2"; shift 2 ;;
+      --config-home=*) WT_CONFIG_HOME="${1#--config-home=}"; shift ;;
+      # The old flags drove an interactive schema walkthrough that no longer
+      # exists. Dying is deliberate: silently accepting them would hide a stale
+      # script or a stale habit.
+      --reset|--non-interactive|--defaults) die "flag no longer supported: $1 (repo config is now written by 'wt init')" ;;
+      --config|--config=*) die "flag no longer supported: $1 (repo config always lives at <repo>/.opencode/wt.json)" ;;
       *) die "unknown option for install: $1 (see --help)" ;;
     esac
   done
+  require_jq
 
-  if ! command -v jq >/dev/null 2>&1; then
-    die "'jq' is required (install with: brew install jq)"
-  fi
-  if $defaults && ! $non_interactive; then
-    die "--defaults requires --non-interactive"
-  fi
-  if $non_interactive && ! $defaults && $reset; then
-    die "--reset cannot be combined with --non-interactive without --defaults"
-  fi
-
-if [[ ! -t 0 ]] && ! $non_interactive && ! $defaults; then
-      # Non-interactive environment (npm postinstall, CI, scripts, cron):
-      # auto-default to avoid prompt loops that break on closed stdin.
-      non_interactive=true
-      defaults=true
-    fi
-
-  local script repo bin wrapper main_root cfg
+  local script bin wrapper gcfg
   script="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
-  main_root="${WT_MAIN_ROOT:-$(main_root_from "$(pwd -P)")}" || die "could not locate the main repository"
-  repo="$main_root"
-  cfg="${cfg_arg:-$main_root/.opencode/wt.json}"
 
-  install_config "$main_root" "$cfg" "$reset" "$non_interactive" "$defaults"
-
-  if [[ -n "${WT_BIN:-}" ]]; then
-    bin="$WT_BIN"
-  elif [[ -d "/opt/homebrew/bin" ]]; then
-    bin="/opt/homebrew/bin"
-  elif [[ -w "/usr/local/bin" ]]; then
-    bin="/usr/local/bin"
+  gcfg="$(global_config_path)"
+  if [[ ! -f "$gcfg" ]]; then
+    mkdir -p "$(dirname "$gcfg")"
+    cat > "$gcfg" <<'JSON'
+{
+  "filesToLink": ["CLAUDE.local.md", ".claude/settings.local.json", ".env"]
+}
+JSON
+    echo "global config written: $gcfg"
   else
-    bin="$HOME/.local/bin"
+    echo "global config already present: $gcfg"
   fi
+
+  if [[ -n "${WT_BIN:-}" ]]; then bin="$WT_BIN"
+  elif [[ -d "/opt/homebrew/bin" ]]; then bin="/opt/homebrew/bin"
+  elif [[ -w "/usr/local/bin" ]]; then bin="/usr/local/bin"
+  else bin="$HOME/.local/bin"; fi
   mkdir -p "$bin"
 
   wrapper="$bin/wt"
@@ -744,20 +484,20 @@ EOF
       ;;
   esac
   echo "installed: $wrapper -> $script"
-  echo "config written for: $repo"
-  echo "run wt from inside any repository: wt new <name> | wt list | wt open <name> | wt teardown <name>"
+  echo "next: cd into a repository and run 'wt init' if it needs its own settings"
 }
 
 clean_artifacts() {
   local wt="$1" f
-  if [[ "$CFG_CODEGRAPH" == "true" ]]; then
+  if [[ "$(cfg '.tools.codegraph.enabled')" == "true" ]]; then
     rm -rf "$wt/.codegraph-$(basename "$wt")" "$wt/.codegraph"
   fi
-  for f in ${CFG_FILES_TO_LINK[@]+"${CFG_FILES_TO_LINK[@]}"}; do
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
     if [[ -L "$wt/$f" ]]; then
       rm -f "$wt/$f"
     fi
-  done
+  done < <(cfg_list '.filesToLink')
 }
 
 resolve_worktree_target() {
@@ -811,7 +551,9 @@ resolve_worktree_target() {
 }
 
 cmd_clean() {
-  local wt
+  local wt mr
+  mr="$(main_root_from "$(pwd -P)")" || die "could not locate the main repository"
+  load_config "$mr"
   wt="$(resolve_worktree_target "${1:-}" | tail -1)"
   clean_artifacts "$wt"
   echo "  artifacts cleaned: $wt"
@@ -830,7 +572,9 @@ cmd_teardown() {
     esac
   done
 
-  local wt
+  local wt mr0
+  mr0="$(main_root_from "$(pwd -P)")" || die "could not locate the main repository"
+  load_config "$mr0"
   wt="$(resolve_worktree_target "$target" | tail -1)"
 
   local main_root branch b
@@ -1016,55 +760,40 @@ IGNORE
   pass "teardown: by name with WT_MAIN_ROOT (installed-wrapper contract)"
 
   local cfg="$repo/.opencode/wt.json"
-  out=$(w install --defaults --non-interactive 2>&1) || fail "install --defaults --non-interactive: $out"
-  [[ -f "$cfg" ]] || fail "install did not write $cfg"
+  rm -f "$cfg"
+  out=$(w init 2>&1) || fail "wt init: $out"
+  [[ -f "$cfg" ]] || fail "init did not write $cfg"
   jq -e . "$cfg" >/dev/null 2>&1 || fail "wt.json is not valid JSON"
   [[ "$(jq -r .basePath "$cfg")" == ".git-worktrees" ]] || fail "basePath default mismatch: $(jq -r .basePath "$cfg")"
-  [[ "$(jq -r .branchPrefix "$cfg")" == "review/" ]] || fail "branchPrefix default mismatch"
-  [[ "$(jq -r .namePattern "$cfg")" == "^review-pr-([0-9]+)$" ]] || fail "namePattern default mismatch"
-  [[ "$(jq -r .fetchPrune "$cfg")" == "true" ]] || fail "fetchPrune default mismatch"
-  [[ "$(jq -r .pullRebase "$cfg")" == "true" ]] || fail "pullRebase default mismatch"
-  [[ "$(jq -r '.filesToLink | join(",")' "$cfg")" == "CLAUDE.local.md,.claude/settings.local.json,.env" ]] || fail "filesToLink default mismatch"
-  [[ "$(jq -r '.npmInstallDirs | join(",")' "$cfg")" == ".,apps/frontend" ]] || fail "npmInstallDirs default mismatch"
-  [[ "$(jq -r '.tools.codegraph.enabled' "$cfg")" == "true" ]] || fail "tools.codegraph.enabled default mismatch"
-  pass "install: writes default wt.json config (all fields)"
+  [[ "$(jq -r '.filesToLink | join(",")' "$cfg")" == "CLAUDE.local.md,.claude/settings.local.json,.env" ]] \
+    || fail "filesToLink default mismatch"
+  pass "init: writes a default repo config"
 
-  out=$(w install --defaults --non-interactive 2>&1) || fail "second install --defaults --non-interactive: $out"
-  [[ "$(jq -r .basePath "$cfg")" == ".git-worktrees" ]] || fail "idempotency: basePath changed"
-  [[ "$(jq -r '.filesToLink | join(",")' "$cfg")" == "CLAUDE.local.md,.claude/settings.local.json,.env" ]] || fail "idempotency: filesToLink changed"
-  pass "install: idempotent (exit 0, values unchanged)"
+  echo '{"basePath":".custom"}' > "$cfg"
+  out=$(w init 2>&1) && fail "init should refuse to overwrite an existing config"
+  [[ "$(jq -r .basePath "$cfg")" == ".custom" ]] || fail "refused init still overwrote the config"
+  out=$(w init --force 2>&1) || fail "init --force: $out"
+  [[ "$(jq -r .basePath "$cfg")" == ".git-worktrees" ]] || fail "init --force did not reset the config"
+  pass "init: refuses to overwrite without --force"
 
-  jq '.basePath = ".wt/worktrees"' "$cfg" > "$cfg.tmp" && mv "$cfg.tmp" "$cfg"
-  [[ "$(jq -r .basePath "$cfg")" == ".wt/worktrees" ]] || fail "manual overwrite of basePath failed"
-  out=$(w install --reset --defaults --non-interactive 2>&1) || fail "install --reset --defaults --non-interactive: $out"
-  [[ "$(jq -r .basePath "$cfg")" == ".git-worktrees" ]] || fail "--reset did not restore default basePath"
-  pass "install: --reset restores defaults over a modified config"
+  # install is machine scope only: it must never write into a repository
+  local scfg="$tmp/splitcfg"
+  rm -rf "$scfg" "$cfg"
+  out=$(cd "$tmp/repo" && WT_CONFIG_HOME="$scfg" WT_BIN="$tmp/bin" bash "$self" install 2>&1) || fail "wt install: $out"
+  [[ -f "$scfg/wt/config.json" ]] || fail "install did not write the global config"
+  [[ -x "$tmp/bin/wt" ]] || fail "install did not write the shim"
+  [[ ! -f "$cfg" ]] || fail "install must not write into a repository"
+  pass "install: machine scope only, never touches a repository"
 
-  rm -f "$cfg"
-  out=$(w install --non-interactive 2>&1) && fail "install --non-interactive without config should have failed"
-  grep -qiE "jq|config" <<<"$out" || fail "error should mention jq or config, got: $out"
-  pass "install: --non-interactive dies without a config"
-
-  # install: rejects filesToLink as a string (must die with an actionable message)
+  # invalid JSON in a config is fatal, never a silent fallback to defaults
   local badcfg="$tmp/badcfg"
   mkdir -p "$badcfg/.opencode"
   (cd "$badcfg" && git init -q)
-  echo '{"basePath":".git-worktrees","branchPrefix":"review/","namePattern":"^review-pr-([0-9]+)$","fetchPrune":true,"pullRebase":true,"filesToLink":"1","npmInstallDirs":["."],"tools":{"codegraph":{"enabled":true}}}' > "$badcfg/.opencode/wt.json"
-  out=$(cd "$badcfg" && WT_MAIN_ROOT="$badcfg" bash "$self" install --non-interactive 2>&1) && fail "install: filesToLink as a string should have been rejected"
-  grep -q "filesToLink must be a JSON array" <<<"$out" || fail "install: expected 'filesToLink must be a JSON array', got: $out"
-  pass "install: rejects filesToLink as a string"
-
-  # install: rejects filesToLink as a comma-separated string
-  echo '{"filesToLink":"1,2,3,4","npmInstallDirs":["."]}' > "$badcfg/.opencode/wt.json"
-  out=$(cd "$badcfg" && WT_MAIN_ROOT="$badcfg" bash "$self" install --non-interactive 2>&1) && fail "install: filesToLink as a comma-separated string should have been rejected"
-  grep -q "filesToLink must be a JSON array" <<<"$out" || fail "install: expected 'filesToLink must be a JSON array', got: $out"
-  pass "install: rejects filesToLink as comma-separated string"
-
-  # install: rejects npmInstallDirs as a string (must die with an actionable message)
-  echo '{"filesToLink":["CLAUDE.local.md"],"npmInstallDirs":"."}' > "$badcfg/.opencode/wt.json"
-  out=$(cd "$badcfg" && WT_MAIN_ROOT="$badcfg" bash "$self" install --non-interactive 2>&1) && fail "install: npmInstallDirs as a string should have been rejected"
-  grep -q "npmInstallDirs must be a JSON array" <<<"$out" || fail "install: expected 'npmInstallDirs must be a JSON array', got: $out"
-  pass "install: rejects npmInstallDirs as a string"
+  echo 'not json' > "$badcfg/.opencode/wt.json"
+  out=$(cd "$badcfg" && WT_MAIN_ROOT="$badcfg" bash "$self" config 2>&1) \
+    && fail "invalid JSON config should have been rejected"
+  grep -q "not valid JSON" <<<"$out" || fail "expected 'not valid JSON', got: $out"
+  pass "config: invalid JSON is fatal, not a silent fallback"
 
   jq -n '{basePath: ".wt-trees"}' > "$cfg"
   out=$(w new review-pr-1234 2>&1) || fail "new (config basePath .wt-trees): $out"
@@ -1099,7 +828,7 @@ IGNORE
   pass "config: branchPrefix + namePattern drive naming"
 
   # defect A — bare invocations must not crash under `set -u`
-  out=$(w install --reset --defaults --non-interactive 2>&1) || fail "reset config for bare-arg tests: $out"
+  rm -f "$cfg"   # reset to built-in defaults
 
   out=$(w new review-pr-5678 2>&1) || fail "new review-pr-5678: $out"
   out=$(cd "$repo/.git-worktrees/review-pr-5678" && bash "$self" bootstrap 2>&1) \
@@ -1117,7 +846,8 @@ IGNORE
   pass "bare bootstrap/clean/teardown work from inside a worktree"
 
   # defect B — the global shim must not be pinned to one repository
-  out=$(w install --reset --defaults --non-interactive 2>&1) || fail "install for shim test: $out"
+  rm -f "$cfg"
+  out=$(w install 2>&1) || fail "install for shim test: $out"
   [[ -x "$tmp/bin/wt" ]] || fail "install did not write an executable shim at $tmp/bin/wt"
   if grep -q "WT_MAIN_ROOT=" "$tmp/bin/wt"; then
     fail "shim pins WT_MAIN_ROOT; it must resolve the repository from the current directory"
@@ -1128,7 +858,7 @@ IGNORE
   pass "install: shim resolves the repository from cwd, not from install time"
 
   # defect B2 — a worktree belonging to another repository must be refused
-  out=$(w install --reset --defaults --non-interactive 2>&1) || fail "reset config for ownership tests: $out"
+  rm -f "$cfg"
   [[ -d "$repo2/.git-worktrees/review-pr-1234" ]] || fail "ownership test needs repo2's worktree from the shim test"
 
   out=$(cd "$tmp/repo" && bash "$self" teardown "$repo2/.git-worktrees/review-pr-1234" 2>&1) \
@@ -1146,7 +876,7 @@ IGNORE
   pass "teardown: refuses other repositories, the main repo, and unregistered directories"
 
   # defect E — teardown must not silently discard work
-  out=$(w install --reset --defaults --non-interactive 2>&1) || fail "reset config for safety tests: $out"
+  rm -f "$cfg"
 
   out=$(w new review-pr-6789 2>&1) || fail "new review-pr-6789: $out"
   echo "uncommitted" >> "$repo/.git-worktrees/review-pr-6789/file.txt"
@@ -1168,7 +898,7 @@ IGNORE
   pass "teardown: refuses dirty worktrees and unmerged branches without --force"
 
   # defect C — cwd must be captured before the worktree is removed
-  out=$(w install --reset --defaults --non-interactive 2>&1) || fail "reset config for cwd tests: $out"
+  rm -f "$cfg"
 
   out=$(w new review-pr-8901 2>&1) || fail "new review-pr-8901: $out"
   out=$(cd "$repo/.git-worktrees/review-pr-8901" && bash "$self" teardown 2>&1) \
@@ -1203,12 +933,47 @@ IGNORE
   [[ "$(m '{"a":1}' '{"b":2}' '{"c":3}')" == '{"a":1,"b":2,"c":3}' ]] || fail "merge: must fold any number of layers"
   pass "config: merge semantics (maps, arrays, ! removal, null, false)"
 
+  # four-layer resolution: defaults < global < repo < env
+  local gcfg="$tmp/globalcfg"
+  mkdir -p "$gcfg/wt"
+  rm -f "$cfg"
+
+  echo '{"branchPrefix":"global/"}' > "$gcfg/wt/config.json"
+  out=$(cd "$tmp/repo" && WT_CONFIG_HOME="$gcfg" bash "$self" config 2>&1) || fail "wt config: $out"
+  [[ "$(jq -r .branchPrefix <<<"$out")" == "global/" ]] || fail "global layer ignored: $out"
+  [[ "$(jq -r .basePath <<<"$out")" == ".git-worktrees" ]] || fail "defaults lost under global layer: $out"
+
+  echo '{"branchPrefix":"repo/"}' > "$cfg"
+  out=$(cd "$tmp/repo" && WT_CONFIG_HOME="$gcfg" bash "$self" config 2>&1) || fail "wt config (repo layer): $out"
+  [[ "$(jq -r .branchPrefix <<<"$out")" == "repo/" ]] || fail "repo layer must beat global: $out"
+
+  out=$(cd "$tmp/repo" && WT_CONFIG_HOME="$gcfg" WT_BRANCH_PREFIX="env/" bash "$self" config 2>&1) \
+    || fail "wt config (env layer): $out"
+  [[ "$(jq -r .branchPrefix <<<"$out")" == "env/" ]] || fail "env layer must beat repo: $out"
+
+  echo '{"filesToLink":["CLAUDE.local.md",".env"]}' > "$gcfg/wt/config.json"
+  echo '{"filesToLink":[".env.test","!.env"]}' > "$cfg"
+  out=$(cd "$tmp/repo" && WT_CONFIG_HOME="$gcfg" bash "$self" config 2>&1) || fail "wt config (arrays): $out"
+  # defaults contribute to the union too, so .claude/settings.local.json survives;
+  # .env is present in defaults AND global yet is removed by the repo's "!.env"
+  [[ "$(jq -c .filesToLink <<<"$out")" == '["CLAUDE.local.md",".claude/settings.local.json",".env.test"]' ]] \
+    || fail "filesToLink must union across layers and honour !: $out"
+
+  out=$(cd "$tmp/repo" && WT_CONFIG_HOME="$gcfg" bash "$self" config --layers 2>&1) || fail "wt config --layers: $out"
+  grep -q "defaults" <<<"$out" || fail "--layers should name the defaults layer, got: $out"
+  grep -q "$cfg" <<<"$out" || fail "--layers should name the repo config path, got: $out"
+
+  rm -f "$cfg" "$gcfg/wt/config.json"
+  pass "config: four layers resolve defaults < global < repo < env"
+
   echo "wt test: $passes groups passed"
 }
 
 case "${1:-}" in
   new) shift; cmd_new "$@" ;;
   list) shift; cmd_list "$@" ;;
+  config) shift; cmd_config "$@" ;;
+  init) shift; cmd_init "$@" ;;
   open) shift; cmd_open "$@" ;;
   install) shift; cmd_install "$@" ;;
   bootstrap) shift; cmd_bootstrap "$@" ;;
