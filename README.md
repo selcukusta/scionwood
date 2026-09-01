@@ -125,6 +125,12 @@ indexes it — and then **launches opencode inside it**. On a Mac that is the sa
 terminal tab you typed the command in. Pass `--no-open` if you just want the
 worktree.
 
+Worktrees live in `.git-worktrees/` inside your repo. The first time `wt` creates
+that directory it adds it to `.git/info/exclude`, so it stays out of `git status`
+and out of anything that scans your repo root. That file is local to your clone
+and never committed — nobody else sees it. If your `.gitignore` already covers the
+directory, `wt` leaves everything alone.
+
 ### Tailoring one repository
 
 Only when a repo needs its own settings — run this **inside that repository**:

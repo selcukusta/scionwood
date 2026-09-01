@@ -412,6 +412,29 @@ APPLESCRIPT
   echo "open it:  cd \"$wt\" && opencode"
 }
 
+# basePath is our directory, inside the user's repo. Left alone it shows up as
+# untracked noise in every git status, and any tool that scans the repo root --
+# an indexer, a linter -- walks into it and processes every worktree twice.
+# .git/info/exclude is the polite place for this: local to the clone, never
+# committed, so it does not appear in anyone else's checkout.
+ensure_local_ignore() { # $1 main_root, $2 basePath
+  local main_root="$1" base gitdir ex
+  base="${2#./}"; base="${base%/}"
+  [[ -n "$base" ]] || return 0
+  # already covered by a committed .gitignore? leave the repo alone
+  git -C "$main_root" check-ignore -q "$base" 2>/dev/null && return 0
+  gitdir="$(git -C "$main_root" rev-parse --git-common-dir 2>/dev/null)" || return 0
+  case "$gitdir" in /*) ;; *) gitdir="$main_root/$gitdir" ;; esac
+  ex="$gitdir/info/exclude"
+  mkdir -p "$(dirname "$ex")"
+  [[ -f "$ex" ]] || : > "$ex"
+  grep -qxF "$base/" "$ex" 2>/dev/null && return 0
+  printf '\n# scionwood: worktrees live here (local to this clone, never committed)\n%s/\n' \
+    "$base" >> "$ex"
+  echo "  note  $base/ added to .git/info/exclude, so it stays out of git status"
+  return 0
+}
+
 default_base_ref() { # $1 main_root; prints the repository's default branch ref
   local main_root="$1" ref
   ref="$(git -C "$main_root" symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null || true)"
@@ -459,6 +482,7 @@ cmd_new() {
   wt="$main_root/$base_path/$name"
   [[ -e "$wt" ]] && die "worktree already exists: $wt"
   mkdir -p "$main_root/$base_path"
+  ensure_local_ignore "$main_root" "$base_path"
 
   # Always fetch: it is read-only and cheap. Never pull/rebase -- mutating the
   # branch the user has checked out is a side effect creating a worktree should
@@ -1772,6 +1796,36 @@ HOOK
   [[ ! -d "$repo/.leftover-trees" ]] || fail "empty basePath left behind after the last teardown"
   rm -f "$cfg"
   pass "teardown: removes basePath once it is empty, keeps it while in use"
+
+  # basePath is our directory inside the user's repo: it must not sit in their
+  # git status, and any repo-root scanner must not walk into it
+  local igrepo="$tmp/igrepo"
+  mkdir -p "$igrepo" && (cd "$igrepo" && git init -q)
+  (cd "$igrepo" && echo x > f && git add f && git -c user.email=t@t -c user.name=t commit -qm i)
+  mkdir -p "$igrepo/.opencode" && jq -n '{tools:{}}' > "$igrepo/.opencode/wt.json"
+  out=$(cd "$igrepo" && WT_MAIN_ROOT="$igrepo" bash "$self" new solo --from HEAD --no-open 2>&1) \
+    || fail "new in the ignore-test repo: $out"
+  grep -q "info/exclude" <<<"$out" || fail "should say it added the local ignore, got: $out"
+  [[ -z "$(git -C "$igrepo" status --porcelain -- .git-worktrees 2>/dev/null)" ]] \
+    || fail "basePath still shows in git status"
+  # idempotent: a second worktree must not append again
+  out=$(cd "$igrepo" && WT_MAIN_ROOT="$igrepo" bash "$self" new solo2 --from HEAD --no-open 2>&1) \
+    || fail "second new in the ignore-test repo: $out"
+  [[ "$(grep -c '^\.git-worktrees/$' "$igrepo/.git/info/exclude")" == "1" ]] \
+    || fail "the exclude entry was written more than once"
+
+  # a repo that already gitignores basePath must be left completely alone
+  local igrepo2="$tmp/igrepo2"
+  mkdir -p "$igrepo2" && (cd "$igrepo2" && git init -q)
+  printf '.git-worktrees/\n' > "$igrepo2/.gitignore"
+  (cd "$igrepo2" && echo x > f && git add f .gitignore && git -c user.email=t@t -c user.name=t commit -qm i)
+  mkdir -p "$igrepo2/.opencode" && jq -n '{tools:{}}' > "$igrepo2/.opencode/wt.json"
+  out=$(cd "$igrepo2" && WT_MAIN_ROOT="$igrepo2" bash "$self" new solo --from HEAD --no-open 2>&1) \
+    || fail "new in the already-ignoring repo: $out"
+  grep -q "info/exclude" <<<"$out" && fail "must not touch a repo that already ignores basePath"
+  [[ ! -s "$igrepo2/.git/info/exclude" ]] || grep -qv "git-worktrees" "$igrepo2/.git/info/exclude" \
+    || fail "wrote to info/exclude despite an existing .gitignore rule"
+  pass "basePath is excluded locally, once, and only when the repo does not already ignore it"
 
   echo "wt test: $passes groups passed"
 }
