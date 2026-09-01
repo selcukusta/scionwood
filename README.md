@@ -46,7 +46,7 @@ Flags (combinable):
 | `--defaults` | Only with `--non-interactive`. Write schema defaults without prompting. |
 | `--config <path>` | Override the config file location (default `.opencode/wt.json`). |
 
-The global wrapper pins `wt` to your repo and `exec`s the repo copy — so `wt` works from any directory and always runs your latest committed version.
+The global wrapper is deliberately **not** bound to the repository you installed it from. It `exec`s the script and lets `wt` find the repository from your current directory, the way `git` does — so one install serves every repo you own, and `wt new` can never create a worktree in the wrong one.
 
 ### Option B — npm
 
@@ -84,7 +84,7 @@ When you're done:
 wt teardown review-pr-1234
 ```
 
-Removes the codegraph data, symlinks, worktree, and branch. If run from inside opencode (`/wt-teardown`), the session exits itself.
+Removes the codegraph data, symlinks, worktree, and branch — but only after checking that you are not about to lose anything. If the worktree has uncommitted changes, or the branch has commits that are not merged, teardown refuses and tells you what it found. Pass `--force` to discard them anyway.
 
 ## Commands
 
@@ -95,11 +95,21 @@ Removes the codegraph data, symlinks, worktree, and branch. If run from inside o
 | `wt open <name>` | Open opencode in an existing worktree. |
 | `wt bootstrap [name\|path]` | Re-run symlinks + codegraph indexing. Idempotent. |
 | `wt clean [name\|path]` | Remove worktree artifacts only (symlinks + codegraph data), keep the worktree and branch. |
-| `wt teardown [name\|path]` | Remove worktree, branch, and codegraph data. Bare `wt teardown` tears down the worktree you're standing in. |
+| `wt teardown [name\|path] [--force]` | Remove worktree, branch, and codegraph data. Refuses if the worktree is dirty or the branch has unmerged commits; `--force` discards them. Bare `wt teardown` tears down the worktree you're standing in. |
 | `wt install [--reset] [--non-interactive] [--defaults] [--config <path>]` | Write `.opencode/wt.json`, then install the global wrapper. |
 | `wt test` | Run the built-in smoke tests (throwaway repo, no side effects). |
 
-Name-based commands work from any directory. Paths are also accepted (e.g. `wt teardown .git-worktrees/review-pr-1234`).
+Name-based commands work from any directory, and bare commands work from anywhere inside a worktree, including its subdirectories. Paths are also accepted (e.g. `wt teardown .git-worktrees/review-pr-1234`).
+
+### Zero tokens
+
+The plugin never invokes the model. It registers no tool, injects nothing into any
+prompt, and ships no slash commands — its whole surface is three non-model hooks
+(`config`, `shell.env`, `event`) that set environment variables and a permission rule.
+
+Worktree management is a command you run. Other opencode worktree plugins hand the
+agent a `worktree_create` tool and spend model tokens on every decision; this one
+cannot, because it never had the tool. A test enforces it.
 
 ## Config
 
@@ -160,7 +170,7 @@ Plus runtime controls:
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `WT_OPEN` | `auto` | How opencode is launched after `new`/`open`. `auto`: same tab when run from a real terminal; otherwise a new tab (iTerm2) / window (Ghostty) of the host terminal. `exec`: always same tab. `tab`: force a new tab. `none`: only print the `cd` command. |
-| `WT_MAIN_ROOT` | autodetected | Skip main-repo autodetection. Set automatically by the global `wt` wrapper. |
+| `WT_MAIN_ROOT` | autodetected | Act on this repository instead of the one containing your current directory. Set it yourself when you need it; the global `wt` wrapper does not. |
 | `WT_BIN` | — | Install target directory for `wt install` (e.g. `WT_BIN=$HOME/.local/bin wt install`). |
 
 Precedence: **env > file > schema default**.

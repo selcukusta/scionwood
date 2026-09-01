@@ -1,5 +1,5 @@
 import { describe, test, expect, beforeEach, afterEach } from "bun:test"
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import path from "node:path"
 import os from "node:os"
 import {
@@ -352,5 +352,33 @@ describe("resolveScriptPath", () => {
 
   test("returns undefined when nothing is present", () => {
     expect(resolveScriptPath(repo, cacheDist, () => false)).toBeUndefined()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// zero-token guarantee: the plugin must never reach the model.
+// This is the project's main differentiator (spec §3.1 claim 3), so it gets a
+// test rather than a comment.
+// ---------------------------------------------------------------------------
+
+describe("zero-token guarantee", () => {
+  const source = readFileSync(path.join(import.meta.dir, "sprig-worktree.ts"), "utf8")
+
+  test("registers no LLM tool", () => {
+    // A `tool` hook would put this plugin's surface in front of the model.
+    expect(source).not.toMatch(/^\s*(tool|"tool")\s*:/m)
+  })
+
+  test("declares only non-model hooks", () => {
+    // literal spaces, not \s — \s would match across newlines
+    const hooks = [...source.matchAll(/^ {4}(?:"([a-z.]+)"|([a-z.]+))\s*:\s*async/gm)]
+      .map((m) => m[1] ?? m[2])
+      .sort()
+    expect(hooks).toEqual(["config", "event", "shell.env"])
+  })
+
+  test("ships no slash commands", () => {
+    expect(existsSync(path.join(import.meta.dir, "..", "commands"))).toBe(false)
+    expect(existsSync(path.join(import.meta.dir, "..", "command"))).toBe(false)
   })
 })
