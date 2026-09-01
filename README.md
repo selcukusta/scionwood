@@ -34,6 +34,28 @@ wt new hotfix --from v2.1.0     # from a tag
 wt new theirs --branch feat-x   # track a remote branch
 ```
 
+## When you'd reach for this
+
+**You need to review a pull request without disturbing what you're working on.**
+`wt new review --pr 1234` checks that PR out in a directory of its own, with its
+own code index, while your branch and your uncommitted changes stay exactly where
+they were. No stash, no `git checkout`, no losing your place.
+
+**Something urgent lands while you're mid-change.** `wt new hotfix --from main`
+gives you a clean tree in seconds, and you go back to the first one by changing
+directory.
+
+**You want a coding agent working somewhere that isn't your main checkout.** Each
+worktree is indexed separately, so what the agent searches is the code actually in
+front of it rather than whatever your main branch happens to hold.
+
+**You want it gone afterwards, completely.** `wt teardown` removes the directory,
+the branch and the tool data — and refuses if that would throw away work you have
+not committed.
+
+Git can already do most of this. What it cannot do is remember your `.env`,
+install your dependencies, index the tree, and refuse to delete your work.
+
 ## Why this one
 
 Several worktree plugins exist for opencode. Four things this one does that they
@@ -334,7 +356,7 @@ Precedence: **env > repo file > global file > built-in default**.
 ## Testing
 
 ```bash
-# Bash CLI integration tests (27 groups, no side effects)
+# Bash CLI integration tests (37 groups, no side effects)
 wt test
 
 # Plugin unit tests (42 tests, requires bun)
