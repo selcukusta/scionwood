@@ -1,7 +1,7 @@
 {
-  "name": "sprig-worktree",
-  "version": "0.1.5",
-  "description": "A sprig of your repo for worktrees — instant isolated environments for PR review, with codegraph integration",
+  "name": "scionwood",
+  "version": "0.2.0",
+  "description": "Worktrees for opencode that pull down code you didn't write — each with its own index",
   "type": "module",
   "main": "dist/index.js",
   "module": "dist/index.js",
@@ -22,8 +22,8 @@
   "scripts": {
     "build": "tsc && node scripts/build.mjs",
     "build:clean": "rm -rf dist && npm run build",
-    "test": "bun test ./.opencode/plugins/sprig-worktree.test.ts && bash .opencode/scripts/wt test",
-    "test:plugin": "bun test ./.opencode/plugins/sprig-worktree.test.ts",
+    "test": "bun test ./.opencode/plugins/scionwood.test.ts && bash .opencode/scripts/wt test",
+    "test:plugin": "bun test ./.opencode/plugins/scionwood.test.ts",
     "test:bash": "bash .opencode/scripts/wt test",
     "prepare": "npm run build",
     "prepublishOnly": "npm run test"
@@ -33,7 +33,12 @@
     "opencode-plugin",
     "worktree",
     "git-worktree",
-    "pr-review"
+    "pr-review",
+    "code-review",
+    "codegraph",
+    "monorepo",
+    "gitlab",
+    "merge-request"
   ],
   "author": {
     "name": "Selçuk Usta",
@@ -42,12 +47,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/selcukusta/sprig-worktree.git"
+    "url": "git+https://github.com/selcukusta/scionwood.git"
   },
   "bugs": {
-    "url": "https://github.com/selcukusta/sprig-worktree/issues"
+    "url": "https://github.com/selcukusta/scionwood/issues"
   },
-  "homepage": "https://github.com/selcukusta/sprig-worktree#readme",
+  "homepage": "https://github.com/selcukusta/scionwood#readme",
   "engines": {
     "node": ">=18",
     "bun": ">=1.3"

@@ -166,7 +166,7 @@ export function resolveScriptPath(
     path.join(directory, SCRIPT_REL),
     path.join(moduleDir, "scripts", "wt"),
     path.join(moduleDir, "..", "scripts", "wt"),
-    path.join(directory, "node_modules", "sprig-worktree", "dist", "scripts", "wt"),
+    path.join(directory, "node_modules", "scionwood", "dist", "scripts", "wt"),
   ]
   return candidates.find(exists)
 }
@@ -190,7 +190,7 @@ export function shouldClean(
   return others.length === 0
 }
 
-function makeLogger(client: any, service = "sprig-worktree"): Logger {
+function makeLogger(client: any, service = "scionwood"): Logger {
   return async (level, message, extra) => {
     try {
       await client.app.log({ body: { service, level, message, extra } })
@@ -209,7 +209,7 @@ async function runScript(
       code: 1,
       output:
         `wt script not found. Looked beside this plugin (${MODULE_DIR}) and in ${directory}. ` +
-        `Install with 'npm install sprig-worktree', or copy .opencode/scripts/wt into your repo.`,
+        `Install with 'npm install scionwood', or copy .opencode/scripts/wt into your repo.`,
     }
   }
   try {
@@ -227,7 +227,7 @@ async function runScript(
   }
 }
 
-export const SprigWorktreePlugin: Plugin = async ({ client, directory }) => {
+export const ScionwoodPlugin: Plugin = async ({ client, directory }) => {
   const log = makeLogger(client)
 
   // First pass with default basePath to find main

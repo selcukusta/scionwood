@@ -18,6 +18,6 @@
     "lib": ["ESNext"],
     "types": ["node", "bun-types"]
   },
-  "include": [".opencode/plugins/sprig-worktree.ts"],
+  "include": [".opencode/plugins/scionwood.ts"],
   "exclude": ["node_modules", "dist", ".opencode/plugins/*.test.ts"]
 }

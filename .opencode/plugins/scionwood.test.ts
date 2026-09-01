@@ -13,7 +13,7 @@ import {
   toolEnv,
   mcpEnvFor,
   DEFAULT_CONFIG,
-} from "./sprig-worktree.ts"
+} from "./scionwood.ts"
 
 // ---------------------------------------------------------------------------
 // suite-wide isolation: snapshot all WT_* env vars and clean temp dirs
@@ -287,7 +287,7 @@ describe("shouldClean", () => {
 
 describe("resolveScriptPath", () => {
   const repo = "/repo"
-  const cacheDist = "/home/u/.cache/opencode/node_modules/sprig-worktree/dist"
+  const cacheDist = "/home/u/.cache/opencode/node_modules/scionwood/dist"
   const only = (...present: string[]) => (p: string) => present.includes(p)
 
   test("prefers the repository's own copy", () => {
@@ -308,7 +308,7 @@ describe("resolveScriptPath", () => {
   })
 
   test("falls back to the repository's node_modules", () => {
-    const legacy = path.join(repo, "node_modules", "sprig-worktree", "dist", "scripts", "wt")
+    const legacy = path.join(repo, "node_modules", "scionwood", "dist", "scripts", "wt")
     expect(resolveScriptPath(repo, cacheDist, only(legacy))).toBe(legacy)
   })
 
@@ -324,7 +324,7 @@ describe("resolveScriptPath", () => {
 // ---------------------------------------------------------------------------
 
 describe("zero-token guarantee", () => {
-  const source = readFileSync(path.join(import.meta.dir, "sprig-worktree.ts"), "utf8")
+  const source = readFileSync(path.join(import.meta.dir, "scionwood.ts"), "utf8")
 
   test("registers no LLM tool", () => {
     // A `tool` hook would put this plugin's surface in front of the model.
