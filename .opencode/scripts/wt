@@ -294,9 +294,12 @@ require_jq() {
 # Reads one JSON document per line on stdin, prints the merged document.
 # Layer order is lowest precedence first.
 #
-#   objects  merge by key, recursively
-#   arrays   union preserving first-seen order; a "!x" entry in a later layer
-#            removes an inherited "x"
+#   objects  merge by key, recursively; a "!x" KEY in a later layer removes an
+#            inherited "x" key
+#   arrays   union preserving first-seen order; a "!x" ENTRY in a later layer
+#            removes an inherited "x" entry
+#
+# One rule, two shapes: a "!"-prefixed name always means "drop what I inherited".
 #   null     in a later layer does not clobber an earlier value
 #   false    is a value, not an absence (the classic `//` bug)
 config_merge() {
@@ -307,7 +310,9 @@ config_merge() {
     def merge($a; $b):
       if   $b == null then $a
       elif ($a|type) == "object" and ($b|type) == "object" then
-        reduce ($b|keys_unsorted[]) as $k ($a; .[$k] = merge($a[$k]; $b[$k]))
+        ( reduce ($b|keys_unsorted[]) as $k ($a; .[$k] = merge($a[$k]; $b[$k])) ) as $m
+        | ( $b | keys_unsorted | map(select(startswith("!"))) ) as $marks
+        | ( $m | delpaths( (($marks + ($marks | map(.[1:]))) | map([.])) ) )
       elif ($a|type) == "array" and ($b|type) == "array" then
         ( ($a + ($b | map(select((type=="string" and startswith("!")) | not)))) | uniq ) as $u
         | ( $b | map(select(type=="string" and startswith("!")) | .[1:]) ) as $rm
@@ -363,12 +368,40 @@ config_read_file() { # $1 path; prints its JSON or {} -- never a partial read
   jq -c . "$f"
 }
 
+# Removed in 0.2.0. Presence in a user-authored config means the user expects
+# behaviour that no longer exists, so this dies rather than ignoring it.
+config_reject_removed() { # $1 human label for the layer, $2 json
+  local label="$1" json="$2" found
+  found="$(jq -r '
+    [ (if has("namePattern")    then "namePattern"    else empty end)
+    , (if has("fetchPrune")     then "fetchPrune"     else empty end)
+    , (if has("pullRebase")     then "pullRebase"     else empty end)
+    , (if has("npmInstallDirs") then "npmInstallDirs" else empty end)
+    , ( (.tools // {}) | to_entries[]
+        | select(.value | type == "object" and has("enabled"))
+        | "tools." + .key + ".enabled" )
+    ] | join(", ")' <<<"$json")"
+  [[ -z "$found" ]] && return 0
+  die "$label: these fields are no longer supported: $found
+  namePattern/fetchPrune/pullRebase -> source selection is now CLI flags:
+      wt new <name> [--pr N | --branch <ref> | --from <ref>]
+  npmInstallDirs -> replaced by hooks.postCreate, a script you edit:
+      wt init   (scaffolds .opencode/hooks/post-create.sh)
+  tools.<name>.enabled -> remove the tool entry to disable it, or point
+      \"detect\" at a binary that is absent
+  See docs/migrating.md"
+}
+
 load_config() { # $1 main_root; idempotent
   local main_root="$1" g_json r_json
   $_CFG_LOADED && return 0
   require_jq
   g_json="$(config_read_file "$(global_config_path)")"
   r_json="$(config_read_file "$main_root/.opencode/wt.json")"
+  # Only the user-authored layers are checked. The built-in defaults still carry
+  # the old fields until they are removed in a later task.
+  config_reject_removed "$(global_config_path)" "$g_json"
+  config_reject_removed "$main_root/.opencode/wt.json" "$r_json"
   WT_CONFIG="$(printf '%s\n%s\n%s\n%s\n' \
     "$(config_defaults_json | jq -c .)" "$g_json" "$r_json" "$(config_env_json)" | config_merge)"
   CFG_BASE_PATH="$(cfg '.basePath')"
@@ -801,19 +834,13 @@ IGNORE
   [[ "$(git -C "$repo/.wt-trees/review-pr-1234" branch --show-current)" == "review/review-pr-1234" ]] || fail "branch wrong with configured basePath"
   pass "config: custom basePath creates worktree there"
 
-  jq -n '{tools: {codegraph: {enabled: false}}}' > "$cfg"
+  jq -n '{tools: {"!codegraph": true}}' > "$cfg"
   rm -f "$tmp/codegraph_called"
-  out=$(w new review-pr-2345 2>&1) || fail "new (codegraph disabled): $out"
-  [[ -d "$repo/.git-worktrees/review-pr-2345" ]] || fail "worktree not created with codegraph disabled"
-  [[ ! -e "$repo/.git-worktrees/review-pr-2345/.codegraph-review-pr-2345" ]] || fail "codegraph data dir created despite disabled"
-  [[ ! -f "$tmp/codegraph_called" ]] || fail "codegraph binary invoked despite disabled"
-  pass "config: codegraph disabled skips indexing"
-
-  jq -n '{fetchPrune: false, pullRebase: false}' > "$cfg"
-  out=$(w new review-pr-3456 2>&1) || fail "new (fetch/pull off): $out"
-  [[ -d "$repo/.git-worktrees/review-pr-3456" ]] || fail "worktree not created with fetchPrune/pullRebase off"
-  [[ "$(git -C "$repo/.git-worktrees/review-pr-3456" branch --show-current)" == "review/review-pr-3456" ]] || fail "branch wrong with fetch/pull off"
-  pass "config: fetchPrune/pullRebase off still creates worktree"
+  out=$(w new review-pr-2345 2>&1) || fail "new (codegraph removed): $out"
+  [[ -d "$repo/.git-worktrees/review-pr-2345" ]] || fail "worktree not created with codegraph removed"
+  [[ ! -e "$repo/.git-worktrees/review-pr-2345/.codegraph-review-pr-2345" ]] || fail "codegraph data dir created despite removal"
+  [[ ! -f "$tmp/codegraph_called" ]] || fail "codegraph binary invoked despite removal"
+  pass "config: !name removes an inherited tool"
 
   jq -n '{basePath: ".cfg-trees"}' > "$cfg"
   out=$(cd "$tmp/repo" && WT_BASE=.env-trees bash "$self" new review-pr-4567 2>&1) || fail "new with WT_BASE override: $out"
@@ -821,11 +848,12 @@ IGNORE
   [[ ! -d "$repo/.cfg-trees/review-pr-4567" ]] || fail "env override did not win over config basePath"
   pass "config: WT_BASE env var overrides config basePath"
 
-  jq -n '{branchPrefix: "pr/", namePattern: "^pull-([0-9]+)$"}' > "$cfg"
-  out=$(w new pull-1234 2>&1) || fail "new pull-1234 (custom name pattern): $out"
-  [[ -d "$repo/.git-worktrees/pull-1234" ]] || fail "worktree not created for pull-1234"
-  [[ "$(git -C "$repo/.git-worktrees/pull-1234" branch --show-current)" == "pr/pull-1234" ]] || fail "expected branch pr/pull-1234"
-  pass "config: branchPrefix + namePattern drive naming"
+  jq -n '{branchPrefix: "pr/"}' > "$cfg"
+  out=$(w new review-pr-3456 2>&1) || fail "new with a custom branchPrefix: $out"
+  [[ -d "$repo/.git-worktrees/review-pr-3456" ]] || fail "worktree not created for review-pr-3456"
+  [[ "$(git -C "$repo/.git-worktrees/review-pr-3456" branch --show-current)" == "pr/review-pr-3456" ]] \
+    || fail "expected branch pr/review-pr-3456"
+  pass "config: branchPrefix drives branch naming"
 
   # defect A — bare invocations must not crash under `set -u`
   rm -f "$cfg"   # reset to built-in defaults
@@ -931,6 +959,10 @@ IGNORE
   [[ "$(m '{"p":true}' '{"p":false}')" == '{"p":false}' ]] || fail "merge: false must win over true"
   [[ "$(m '{"f":["a"]}' '{"f":["!ghost"]}')" == '{"f":["a"]}' ]] || fail "merge: removing an absent entry is a no-op"
   [[ "$(m '{"a":1}' '{"b":2}' '{"c":3}')" == '{"a":1,"b":2,"c":3}' ]] || fail "merge: must fold any number of layers"
+  [[ "$(m '{"t":{"cg":{"x":1},"dk":{"y":2}}}' '{"t":{"!cg":true}}')" \
+     == '{"t":{"dk":{"y":2}}}' ]] || fail "merge: ! must remove an inherited map key"
+  [[ "$(m '{"t":{"cg":{"x":1}}}' '{"t":{}}')" \
+     == '{"t":{"cg":{"x":1}}}' ]] || fail "merge: an empty map must not silently drop inherited keys"
   pass "config: merge semantics (maps, arrays, ! removal, null, false)"
 
   # four-layer resolution: defaults < global < repo < env
@@ -965,6 +997,24 @@ IGNORE
 
   rm -f "$cfg" "$gcfg/wt/config.json"
   pass "config: four layers resolve defaults < global < repo < env"
+
+  # removed fields must be rejected, never silently ignored
+  local badcfg2="$tmp/badcfg2"
+  mkdir -p "$badcfg2/.opencode"
+  (cd "$badcfg2" && git init -q)
+  local rf
+  for rf in namePattern fetchPrune pullRebase npmInstallDirs; do
+    echo "{\"$rf\":null}" > "$badcfg2/.opencode/wt.json"
+    out=$(cd "$badcfg2" && WT_MAIN_ROOT="$badcfg2" bash "$self" config 2>&1) \
+      && fail "config accepted removed field '$rf'"
+    grep -q "$rf" <<<"$out" || fail "error should name the removed field '$rf', got: $out"
+    grep -qi "no longer" <<<"$out" || fail "error should say the field is no longer supported, got: $out"
+  done
+  echo '{"tools":{"codegraph":{"enabled":true}}}' > "$badcfg2/.opencode/wt.json"
+  out=$(cd "$badcfg2" && WT_MAIN_ROOT="$badcfg2" bash "$self" config 2>&1) \
+    && fail "config accepted removed field tools.*.enabled"
+  grep -q "enabled" <<<"$out" || fail "error should name tools.*.enabled, got: $out"
+  pass "config: removed fields are rejected with an actionable message"
 
   echo "wt test: $passes groups passed"
 }
