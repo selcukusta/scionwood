@@ -64,6 +64,14 @@ EOF
 
 die() { echo "wt: error: $*" >&2; exit 1; }
 
+# Every command except --version needs a git repository. "could not locate the
+# main repository" is our jargon; the user just knows they are somewhere else.
+die_not_in_repo() {
+  die "not inside a git repository: $(pwd -P)
+  cd into your project first, then run this again.
+  (or set WT_MAIN_ROOT=/path/to/repo to point at one explicitly)"
+}
+
 # Fully resolve a path, following symlink chains. macOS ships neither
 # `readlink -f` nor realpath(1), and plain `readlink` returns the raw target,
 # which is often relative -- so comparing its output directly is wrong.
@@ -430,7 +438,7 @@ cmd_new() {
 
   local main_root
   main_root="$(main_root_from "$(pwd -P)")" \
-    || die "could not locate the main repository (run from inside the repo, or set WT_MAIN_ROOT)"
+    || die_not_in_repo
   load_config "$main_root"
 
   local branch base_path wt
@@ -482,7 +490,7 @@ cmd_new() {
 
 cmd_bootstrap() {
   local wt mr
-  mr="$(main_root_from "$(pwd -P)")" || die "could not locate the main repository"
+  mr="$(main_root_from "$(pwd -P)")" || die_not_in_repo
   load_config "$mr"
   wt="$(resolve_worktree_target "${1:-}" | tail -1)"
   bootstrap_dir "$wt"
@@ -490,7 +498,7 @@ cmd_bootstrap() {
 
 cmd_list() {
   local main_root base d name branch found=""
-  main_root="$(main_root_from "$(pwd -P)")" || die "could not locate the main repository"
+  main_root="$(main_root_from "$(pwd -P)")" || die_not_in_repo
   load_config "$main_root"
   base="$main_root/$CFG_BASE_PATH"
   if [[ -d "$base" ]]; then
@@ -515,7 +523,7 @@ cmd_open() {
   local name="${1:-}"
   [[ -n "$name" ]] || usage
   local main_root wt
-  main_root="$(main_root_from "$(pwd -P)")" || die "could not locate the main repository"
+  main_root="$(main_root_from "$(pwd -P)")" || die_not_in_repo
   load_config "$main_root"
   wt="$main_root/$CFG_BASE_PATH/$name"
   [[ -d "$wt" ]] || die "worktree not found: $CFG_BASE_PATH/$name (see 'wt list')"
@@ -665,7 +673,7 @@ cmd_config() {
     esac
   done
   local main_root
-  main_root="${WT_MAIN_ROOT:-$(main_root_from "$(pwd -P)")}" || die "could not locate the main repository"
+  main_root="${WT_MAIN_ROOT:-$(main_root_from "$(pwd -P)")}" || die_not_in_repo
   load_config "$main_root"
   if $show_layers; then
     local g r
@@ -690,7 +698,7 @@ cmd_init() {
   done
   require_jq
   local main_root cfg_path hooks
-  main_root="${WT_MAIN_ROOT:-$(main_root_from "$(pwd -P)")}" || die "could not locate the main repository"
+  main_root="${WT_MAIN_ROOT:-$(main_root_from "$(pwd -P)")}" || die_not_in_repo
   cfg_path="$main_root/.opencode/wt.json"
   hooks="$main_root/.opencode/hooks"
   if [[ -f "$cfg_path" ]] && ! $force; then
@@ -905,7 +913,7 @@ clean_artifacts() {
 resolve_worktree_target() {
   local target="${1:-}"
   local main_root wt base registered m
-  main_root="$(main_root_from "$(pwd -P)")" || die "could not locate the main repository"
+  main_root="$(main_root_from "$(pwd -P)")" || die_not_in_repo
   load_config "$main_root"
   main_root="$(cd "$main_root" && pwd -P)"
 
@@ -954,7 +962,7 @@ resolve_worktree_target() {
 
 cmd_clean() {
   local wt mr
-  mr="$(main_root_from "$(pwd -P)")" || die "could not locate the main repository"
+  mr="$(main_root_from "$(pwd -P)")" || die_not_in_repo
   load_config "$mr"
   wt="$(resolve_worktree_target "${1:-}" | tail -1)"
   clean_artifacts "$wt"
@@ -975,7 +983,7 @@ cmd_teardown() {
   done
 
   local wt mr0
-  mr0="$(main_root_from "$(pwd -P)")" || die "could not locate the main repository"
+  mr0="$(main_root_from "$(pwd -P)")" || die_not_in_repo
   load_config "$mr0"
   wt="$(resolve_worktree_target "$target" | tail -1)"
 
@@ -1700,6 +1708,23 @@ HOOK
     || fail "a branch with no unique commits must not be reported as unmerged: $out"
   rm -f "$cfg"
   pass "teardown: hook-rewritten tracked files pass, user edits and unique commits do not"
+
+  # outside a git repository the error must be understandable to someone who
+  # has never heard the phrase "main repository"
+  local outside="$tmp/not-a-repo"
+  mkdir -p "$outside"
+  local c
+  for c in init list config; do
+    out=$(cd "$outside" && bash "$self" $c 2>&1) && fail "wt $c should fail outside a repository"
+    grep -q "not inside a git repository" <<<"$out" || fail "wt $c: expected a plain-language error, got: $out"
+    grep -q "cd into your project" <<<"$out" || fail "wt $c: the error should say what to do, got: $out"
+  done
+  out=$(cd "$outside" && bash "$self" new demo 2>&1) && fail "wt new should fail outside a repository"
+  grep -q "not inside a git repository" <<<"$out" || fail "wt new: expected a plain-language error, got: $out"
+  # ...but --version needs no repository at all
+  out=$(cd "$outside" && bash "$self" --version 2>&1) || fail "wt --version must work outside a repository: $out"
+  grep -qE "scionwood [0-9]" <<<"$out" || fail "--version outside a repo, got: $out"
+  pass "outside a repository: plain error with the fix, except --version"
 
   echo "wt test: $passes groups passed"
 }

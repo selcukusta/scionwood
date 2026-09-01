@@ -69,7 +69,8 @@ Code, reimplemented natively for opencode.
 
 ## Install
 
-Three steps, once per machine.
+Three steps, once per machine. Run them from anywhere — no need to be in a
+project yet.
 
 **1. Install it.**
 
@@ -109,8 +110,11 @@ The `wt` command works without it; the isolation does not.
 wt --version
 ```
 
-That's it. `wt new my-worktree` works right now, in any git repository, with no
-config at all.
+That's it. `wt new my-worktree` works right now, with no config at all.
+
+From here on, run `wt` **inside the project you want a worktree for** — it works
+out which repository you are in the same way `git` does. Only `wt --version`
+works anywhere.
 
 ### What `wt new` does
 
@@ -121,9 +125,10 @@ worktree.
 
 ### Tailoring one repository
 
-Only when a repo needs its own settings:
+Only when a repo needs its own settings — run this **inside that repository**:
 
 ```bash
+cd ~/code/my-project
 wt init
 ```
 
