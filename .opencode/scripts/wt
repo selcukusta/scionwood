@@ -24,7 +24,10 @@ usage:
                               (configured dirs) + codegraph index
   wt clean [name|path]        remove worktree artifacts only (symlinks + tool data),
                               keep the worktree and branch
-  wt teardown [name|path]     remove worktree + branch + codegraph data
+  wt teardown [name|path] [--force]
+                              remove worktree + branch + codegraph data
+                              refuses if the worktree is dirty or the branch has
+                              unmerged commits; --force discards them
                               name = folder under <basePath> (works from anywhere);
                               path = direct path; default: cwd
   wt install [--reset] [--non-interactive] [--defaults] [--config <path>]
@@ -775,8 +778,20 @@ cmd_clean() {
 }
 
 cmd_teardown() {
+  local force=false target="" arg
+  while [[ $# -gt 0 ]]; do
+    arg="$1"
+    case "$arg" in
+      --force) force=true; shift ;;
+      -*) die "unknown option for teardown: $arg (see --help)" ;;
+      *)
+        [[ -z "$target" ]] || die "teardown takes at most one worktree, got '$target' and '$arg'"
+        target="$arg"; shift ;;
+    esac
+  done
+
   local wt
-  wt="$(resolve_worktree_target "${1:-}" | tail -1)"
+  wt="$(resolve_worktree_target "$target" | tail -1)"
 
   local main_root branch b
   main_root="$(main_root_from "$wt")" || die "could not locate main repository root above $wt"
@@ -784,14 +799,41 @@ cmd_teardown() {
     /^worktree / { inblock = ($0 == "worktree " w) }
     inblock && /^branch / { sub(/^branch /, ""); print; exit }
   ' || true)"
+  b="${branch#refs/heads/}"
+
+  if ! $force; then
+    local dirty unmerged=""
+    dirty="$(git -C "$wt" status --porcelain 2>/dev/null || true)"
+    # git marks the current branch with '*' and any branch checked out in a
+    # linked worktree with '+'. The branch being torn down always carries '+',
+    # so both prefixes must be stripped or every teardown looks unmerged.
+    if [[ -n "$b" ]] && ! git -C "$main_root" branch --merged HEAD 2>/dev/null \
+        | sed 's/^[*+ ]*//' | grep -Fxq "$b"; then
+      unmerged="$b"
+    fi
+    if [[ -n "$dirty" || -n "$unmerged" ]]; then
+      echo "wt: error: refusing to tear down $wt" >&2
+      if [[ -n "$dirty" ]]; then
+        echo "  uncommitted changes:" >&2
+        printf '%s\n' "$dirty" | sed 's/^/    /' >&2
+      fi
+      if [[ -n "$unmerged" ]]; then
+        echo "  branch '$unmerged' has unmerged commits (not reachable from HEAD of $main_root)" >&2
+      fi
+      echo "  commit your work first, or re-run with --force to discard it" >&2
+      exit 1
+    fi
+  fi
+
+  local invoked_from
+  invoked_from="$(pwd -P 2>/dev/null || true)"
 
   clean_artifacts "$wt"
 
   git -C "$main_root" worktree remove --force "$wt"
   echo "  worktree removed: $wt"
 
-  if [[ -n "$branch" ]]; then
-    b="${branch#refs/heads/}"
+  if [[ -n "$b" ]]; then
     if git -C "$main_root" branch -D "$b" >/dev/null 2>&1; then
       echo "  branch deleted: $b"
     else
@@ -800,11 +842,7 @@ cmd_teardown() {
   fi
   echo "teardown complete"
 
-  local was_inside=false
-  if [[ "$(pwd -P)" == "$wt" ]]; then
-    was_inside=true
-  fi
-  if $was_inside; then
+  if [[ -n "$invoked_from" && ( "$invoked_from" == "$wt" || "$invoked_from" == "$wt"/* ) ]]; then
     if [[ ! -t 0 && "${WT_OPEN:-auto}" != "none" ]]; then
       echo "reopening opencode at the repository root..."
       open_in_terminal "$main_root"
@@ -1066,6 +1104,28 @@ IGNORE
     && fail "teardown accepted a plain directory that is not a registered worktree"
   rm -rf "$repo/.git-worktrees/not-a-worktree"
   pass "teardown: refuses other repositories, the main repo, and unregistered directories"
+
+  # defect E — teardown must not silently discard work
+  out=$(w install --reset --defaults --non-interactive 2>&1) || fail "reset config for safety tests: $out"
+
+  out=$(w new review-pr-6789 2>&1) || fail "new review-pr-6789: $out"
+  echo "uncommitted" >> "$repo/.git-worktrees/review-pr-6789/file.txt"
+  out=$(w teardown review-pr-6789 2>&1) && fail "teardown removed a dirty worktree without --force"
+  grep -q "uncommitted" <<<"$out" || fail "refusal should name the uncommitted changes, got: $out"
+  [[ -d "$repo/.git-worktrees/review-pr-6789" ]] || fail "refused teardown still removed the worktree"
+  out=$(w teardown review-pr-6789 --force 2>&1) || fail "teardown --force on a dirty worktree: $out"
+  [[ ! -d "$repo/.git-worktrees/review-pr-6789" ]] || fail "--force did not remove the worktree"
+
+  out=$(w new review-pr-7890 2>&1) || fail "new review-pr-7890: $out"
+  echo "extra" >> "$repo/.git-worktrees/review-pr-7890/file.txt"
+  git -C "$repo/.git-worktrees/review-pr-7890" add file.txt
+  git -C "$repo/.git-worktrees/review-pr-7890" -c user.email=t@t -c user.name=t commit -qm "unmerged work"
+  out=$(w teardown review-pr-7890 2>&1) && fail "teardown deleted a branch with unmerged commits without --force"
+  grep -q "unmerged" <<<"$out" || fail "refusal should mention unmerged commits, got: $out"
+  [[ -d "$repo/.git-worktrees/review-pr-7890" ]] || fail "refused teardown still removed the worktree"
+  out=$(w teardown review-pr-7890 --force 2>&1) || fail "teardown --force with unmerged commits: $out"
+  [[ ! -d "$repo/.git-worktrees/review-pr-7890" ]] || fail "--force did not remove the worktree"
+  pass "teardown: refuses dirty worktrees and unmerged branches without --force"
 
   echo "wt test: $passes groups passed"
 }
