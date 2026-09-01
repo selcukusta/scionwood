@@ -238,7 +238,7 @@ cmd_new() {
 
 cmd_bootstrap() {
   local wt
-  wt="$(resolve_worktree_target "$1" | tail -1)"
+  wt="$(resolve_worktree_target "${1:-}" | tail -1)"
   bootstrap_dir "$wt"
 }
 
@@ -745,14 +745,14 @@ resolve_worktree_target() {
 
 cmd_clean() {
   local wt
-  wt="$(resolve_worktree_target "$1" | tail -1)"
+  wt="$(resolve_worktree_target "${1:-}" | tail -1)"
   clean_artifacts "$wt"
   echo "  artifacts cleaned: $wt"
 }
 
 cmd_teardown() {
   local wt
-  wt="$(resolve_worktree_target "$1" | tail -1)"
+  wt="$(resolve_worktree_target "${1:-}" | tail -1)"
 
   local main_root branch b
   main_root="$(main_root_from "$wt")" || die "could not locate main repository root above $wt"
@@ -995,6 +995,24 @@ IGNORE
   [[ -d "$repo/.git-worktrees/pull-1234" ]] || fail "worktree not created for pull-1234"
   [[ "$(git -C "$repo/.git-worktrees/pull-1234" branch --show-current)" == "pr/pull-1234" ]] || fail "expected branch pr/pull-1234"
   pass "config: branchPrefix + namePattern drive naming"
+
+  # defect A — bare invocations must not crash under `set -u`
+  out=$(w install --reset --defaults --non-interactive 2>&1) || fail "reset config for bare-arg tests: $out"
+
+  out=$(w new review-pr-5678 2>&1) || fail "new review-pr-5678: $out"
+  out=$(cd "$repo/.git-worktrees/review-pr-5678" && bash "$self" bootstrap 2>&1) \
+    || fail "bare bootstrap from inside the worktree: $out"
+  [[ -L "$repo/.git-worktrees/review-pr-5678/.env" ]] || fail "bare bootstrap did not link .env"
+
+  out=$(cd "$repo/.git-worktrees/review-pr-5678" && bash "$self" clean 2>&1) \
+    || fail "bare clean from inside the worktree: $out"
+  [[ ! -e "$repo/.git-worktrees/review-pr-5678/.env" ]] || fail "bare clean did not remove the symlink"
+  [[ -d "$repo/.git-worktrees/review-pr-5678" ]] || fail "bare clean removed the worktree"
+
+  out=$(cd "$repo/.git-worktrees/review-pr-5678" && bash "$self" teardown 2>&1) \
+    || fail "bare teardown from inside the worktree: $out"
+  [[ ! -d "$repo/.git-worktrees/review-pr-5678" ]] || fail "bare teardown did not remove the worktree"
+  pass "bare bootstrap/clean/teardown work from inside a worktree"
 
   echo "wt test: $passes groups passed"
 }
