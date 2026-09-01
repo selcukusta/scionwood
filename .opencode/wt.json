@@ -1,21 +1,17 @@
 {
   "basePath": ".git-worktrees",
-  "branchPrefix": "review/",
-  "namePattern": "^review-pr-([0-9]+)$",
-  "fetchPrune": true,
-  "pullRebase": true,
-  "filesToLink": [
-    "CLAUDE.local.md",
-    ".claude/settings.local.json",
-    ".env"
-  ],
-  "npmInstallDirs": [
-    ".",
-    "apps/frontend"
-  ],
+  "branchPrefix": "wt/",
+  "prRef": "pull/{n}/head",
+  "filesToLink": ["CLAUDE.local.md", ".claude/settings.local.json", ".env"],
   "tools": {
     "codegraph": {
-      "enabled": true
+      "detect": "codegraph",
+      "dataDir": ".codegraph-{name}",
+      "env": {
+        "CODEGRAPH_PROJECT_PATH": "{worktree}",
+        "CODEGRAPH_DATA_DIR": "{dataDir}"
+      },
+      "setup": "codegraph init -i && codegraph sync"
     }
   }
 }
