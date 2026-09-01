@@ -157,10 +157,41 @@ tool_expand() { # $1 tool, $2 template, $3 worktree
   printf '%s' "$tpl"
 }
 
-# Paths wt created inside the worktree: the symlinks it made and each tool's
-# data dir. These are artifacts of the tool, not the user's work, so the
-# teardown safety check must not count them as uncommitted changes -- otherwise
-# linking a file that is not gitignored makes every teardown refuse forever.
+# Where the record of bootstrap-created files lives. Inside the worktree's git
+# dir, so it is per-worktree, never in the working tree, and disappears with the
+# worktree. (A per-worktree info/exclude would not work: git reads that from the
+# common git dir, so it would leak into the main repo.)
+artifacts_file() { # $1 worktree
+  local gd
+  gd="$(git -C "$1" rev-parse --absolute-git-dir 2>/dev/null)" || return 1
+  echo "$gd/wt-artifacts"
+}
+
+untracked_now() { # $1 worktree; one path per line, directories collapsed
+  git -C "$1" status --porcelain 2>/dev/null | awk '$1 == "??" { print substr($0, 4) }' | sed 's:/$::'
+}
+
+# Record whatever bootstrap caused to exist. Tools create artifacts they never
+# declare -- codegraph writes .codegraph/ alongside the dataDir it was told to
+# use -- so listing them per tool would always be one step behind. Diffing the
+# untracked set across bootstrap catches them all, whatever produced them.
+record_artifacts() { # $1 worktree, $2 newline-separated "before" snapshot
+  local wt="$1" before="$2" af line
+  af="$(artifacts_file "$wt")" || return 0
+  mkdir -p "$(dirname "$af")"
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    grep -Fxq "$line" <<<"$before" && continue
+    grep -Fxq "$line" "$af" 2>/dev/null || echo "$line" >> "$af"
+  done < <(untracked_now "$wt")
+  return 0
+}
+
+# Paths wt created inside the worktree: the symlinks it made, each tool's data
+# dir, and anything bootstrap caused to appear. These are artifacts of the tool,
+# not the user's work, so the teardown safety check must not count them as
+# uncommitted changes -- otherwise the tool manufactures the condition that
+# blocks its own teardown, and --force becomes a reflex.
 wt_own_paths() { # $1 worktree
   local f d
   while IFS= read -r f; do
@@ -171,6 +202,8 @@ wt_own_paths() { # $1 worktree
     [[ -n "$d" ]] || continue
     case "$d" in "$1"/*) echo "${d#$1/}" ;; esac
   done < <(tools_data_dirs "$1")
+  local af
+  af="$(artifacts_file "$1" 2>/dev/null)" && [[ -f "$af" ]] && cat "$af"
   return 0
 }
 
@@ -220,10 +253,11 @@ tools_run() { # $1 phase (setup|teardown), $2 worktree
 
 bootstrap_dir() {
   local wt="$1"
-  local main_root name f d
+  local main_root name f d before_untracked
   main_root="$(main_root_from "$wt")" || die "could not locate main repository root above $wt"
   load_config "$main_root"
   name="$(basename "$wt")"
+  before_untracked="$(untracked_now "$wt")"
 
   while IFS= read -r f; do
     [[ -n "$f" ]] || continue
@@ -244,6 +278,7 @@ bootstrap_dir() {
 
   tools_run setup "$wt"
 
+  record_artifacts "$wt" "$before_untracked"
   echo "  bootstrap complete: $wt"
 }
 
@@ -1331,6 +1366,17 @@ HOOK
   out=$(w teardown review-pr-1357 2>&1) \
     || fail "teardown must not be blocked by a symlink wt itself created: $out"
   [[ ! -d "$owt" ]] || fail "teardown did not remove the worktree"
+
+  # a tool that creates an UNDECLARED artifact must not block teardown either.
+  # codegraph writes .codegraph/ next to the dataDir it was told to use, so
+  # listing artifacts per tool would always be one step behind.
+  jq -n '{tools:{"!codegraph":true, litter:{setup:"mkdir -p .undeclared-junk && touch .undeclared-junk/x"}}}' > "$cfg"
+  out=$(w new review-pr-3579 --pr 3579 2>&1) || fail "new for undeclared-artifact test: $out"
+  local jwt="$repo/.git-worktrees/review-pr-3579"
+  [[ -d "$jwt/.undeclared-junk" ]] || fail "fixture: the tool did not create its artifact"
+  out=$(w teardown review-pr-3579 2>&1) \
+    || fail "teardown must not be blocked by an artifact a tool created: $out"
+  [[ ! -d "$jwt" ]] || fail "teardown did not remove the worktree after the artifact test"
 
   # ...but genuine work must still block it
   out=$(w new review-pr-2468 --pr 2468 2>&1) || fail "new for real-work test: $out"
