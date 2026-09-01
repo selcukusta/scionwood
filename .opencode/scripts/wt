@@ -163,7 +163,7 @@ run_hook() { # $1 phase (postCreate|preTeardown), $2 worktree
     echo "  hook  $phase ($spec)"
     if ! (cd "$wt" && WT_NAME="$name" WT_ROOT="$wt" WT_MAIN_ROOT="$main_root" WT_BRANCH="$branch" \
           "$candidate"); then
-      hook_failed_note "$phase" "$spec" "$wt" "$wt"
+      hook_failed_note "$phase" "$spec" "$wt"
     fi
     return 0
   fi
@@ -182,7 +182,7 @@ run_hook() { # $1 phase (postCreate|preTeardown), $2 worktree
   echo "  hook  $phase (inline)"
   if ! (cd "$wt" && WT_NAME="$name" WT_ROOT="$wt" WT_MAIN_ROOT="$main_root" WT_BRANCH="$branch" \
         bash -c "$spec"); then
-    hook_failed_note "$phase" "$spec"
+    hook_failed_note "$phase" "$spec" "$wt"
   fi
   return 0
 }
