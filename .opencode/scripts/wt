@@ -597,7 +597,6 @@ config_defaults_json() {
     "codegraph": {
       "detect": "codegraph",
       "dataDir": ".codegraph",
-      "env": { "CODEGRAPH_PROJECT_PATH": "{worktree}", "CODEGRAPH_DATA_DIR": "{dataDir}" },
       "setup": "codegraph init -i && codegraph sync"
     }
   }

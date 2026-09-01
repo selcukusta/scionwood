@@ -34,20 +34,33 @@ A tool is any program that should be isolated per worktree. Six lines, no code:
 Every field is optional. Placeholders: `{name}`, `{worktree}`, `{mainRoot}`,
 `{branch}`, `{dataDir}`.
 
-### How `env` reaches your agent
+### What actually isolates a tool
 
-This is the part that makes a tool actually isolated rather than merely
-configured. The same `env` map is applied in three places:
+Two different mechanisms, and it is worth knowing which one you are relying on.
+
+**Most tools isolate themselves, because a worktree is a separate directory.**
+Anything that resolves its state from the working directory — codegraph is one —
+is already per-worktree before `env` enters the picture. The shipped `codegraph`
+entry declares no `env` for exactly this reason: verified against codegraph 1.5.0,
+its CLI ignores `CODEGRAPH_DATA_DIR` and its MCP server finds the project by
+walking up from its working directory. Injecting those variables looked like it
+was doing the work; it was doing nothing.
+
+**`env` is for tools that genuinely read the environment.** Docker is the clear
+case: `COMPOSE_PROJECT_NAME` is the only thing that stops two worktrees colliding
+on container names. When a tool does read env, the same map is applied in three
+places:
 
 1. **The CLI** exports it around `setup` and `teardown`.
 2. **The plugin** injects it into `shell.env`, so every shell command the agent
    runs inside the worktree sees it.
 3. **The plugin** injects it into any MCP server whose name or command contains
-   the tool key — so an MCP-based indexer is scoped to the worktree without a
-   line of code.
+   the tool key — so a tool called `ctags` matches a server named `ctags`,
+   `ctags-mcp`, or one whose command mentions `ctags`.
 
-That third one is why the key matters: a tool called `ctags` will match an MCP
-server named `ctags`, `ctags-mcp`, or one whose command mentions `ctags`.
+Before adding an `env` block, check that your tool actually reads those variables.
+A variable nothing reads is worse than no variable: it implies a guarantee that
+is not there.
 
 `dataDir` is resolved relative to the worktree and is only ever deleted from
 inside it. An absolute or `../`-bearing `dataDir` is refused with a warning

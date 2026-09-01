@@ -45,7 +45,9 @@ flow work on GitLab, Gitea and Bitbucket.
 
 **2. Each worktree gets its own tools.** A `tools` entry gives a worktree its own
 code index, its own docker compose project, its own anything — six lines of
-config, no code. See [docs/extending.md](docs/extending.md).
+config, no code. `wt` runs each tool's setup in the worktree, exports its
+environment to every shell and matching MCP server there, and removes its data on
+teardown. See [docs/extending.md](docs/extending.md).
 
 **3. Zero tokens.** The plugin never invokes the model. It registers no tool,
 injects nothing into any prompt, and ships no slash commands — its whole surface
@@ -231,10 +233,6 @@ Six keys. Everything optional — with no config at all, `wt new spike-auth` wor
     "codegraph": {
       "detect": "codegraph",
       "dataDir": ".codegraph",
-      "env": {
-        "CODEGRAPH_PROJECT_PATH": "{worktree}",
-        "CODEGRAPH_DATA_DIR": "{dataDir}"
-      },
       "setup": "codegraph init -i && codegraph sync"
     }
   }
